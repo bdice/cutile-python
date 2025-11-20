@@ -161,3 +161,7 @@ class TileCompilerError(TileInternalError):
         if loc is None:
             loc = _unknown_loc
         super().__init__(f"Return code {return_code}\n{message}", loc)
+
+
+class TileCompilerTimeoutError(TileInternalError):
+    pass

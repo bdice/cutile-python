@@ -89,7 +89,7 @@ def test_write_simple_module():
     with NamedTemporaryFile() as f:
         f.write(buf)
         f.flush()
-        cubin_path = compile_cubin(f.name, CompilerOptions(), get_sm_arch())
+        cubin_path = compile_cubin(f.name, CompilerOptions(), get_sm_arch(), None)
 
     compile = HackCompileCallback(str(cubin_path), "foo")
     kernel = _cext.TileDispatcher((False, False, False), compile)

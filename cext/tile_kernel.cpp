@@ -1627,14 +1627,13 @@ static PyTypeObject ArraySpecialization_type = {
 static Status init_default_tile_context() {
     PyPtr context_module = steal(PyImport_ImportModule("cuda.tile._context"));
     if (!context_module) return ErrorRaised;
-    PyPtr default_context = steal(
-            PyObject_CallMethod(context_module.get(),
-            "init_context_from_env",
-            "O",
-            reinterpret_cast<PyObject*>(&TileContext_type))
+    PyPtr default_context_config = steal(
+        PyObject_CallMethod(context_module.get(), "init_context_config_from_env", "")
     );
-    if (!default_context) return ErrorRaised;
-    g_default_tile_context = default_context.release();
+    if (!default_context_config) return ErrorRaised;
+    g_default_tile_context = pywrapper_new<TileContext>(&TileContext_type, nullptr, nullptr);
+    if (!g_default_tile_context) return ErrorRaised;
+    py_unwrap<TileContext>(g_default_tile_context).config = default_context_config;
     return OK;
 };
 

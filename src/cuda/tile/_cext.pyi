@@ -34,3 +34,6 @@ class TileContext:
     @property
     def config(self) -> TileContextConfig:
         ...
+
+
+default_tile_context: TileContext

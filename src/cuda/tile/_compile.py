@@ -20,7 +20,7 @@ from cuda.tile._ast2ir import get_function_ir
 from cuda.tile._cext import get_compute_capability, TileContext, default_tile_context
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._const_utils import get_constant_annotations
-from cuda.tile._exception import TileCompilerError
+from cuda.tile._exception import TileCompilerError, TileCompilerTimeoutError
 from cuda.tile._ir import ir
 from cuda.tile._passes.code_motion import hoist_loop_invariants
 from cuda.tile._passes.loop_split import split_loops
@@ -154,7 +154,10 @@ def compile_tile(pyfunc,
                                      dir=context.config.temp_dir, delete=False) as f:
         f.write(bytecode_buf)
         f.flush()
-        cubin_file = compile_cubin(f.name, compiler_options, sm_arch)
+        cubin_file = compile_cubin(f.name,
+                                   compiler_options,
+                                   sm_arch,
+                                   timeout_sec=context.config.compiler_timeout_sec)
     return TileLibrary(func_ir.qualname, cubin_file, bytecode_buf, func_ir)
 
 
@@ -227,8 +230,10 @@ def get_sm_arch() -> str:
 
 
 def compile_cubin(
-        fname_bytecode: str, compiler_options: CompilerOptions, sm_arch: str
-        ) -> Path:
+        fname_bytecode: str,
+        compiler_options: CompilerOptions,
+        sm_arch: str,
+        timeout_sec: Optional[int]) -> Path:
     compiler_bin, bin_path, ld_path = _find_compiler_bin()
     fname_cubin = Path(fname_bytecode).with_suffix(".cubin")
     compiler_hints = compiler_options.specialize_for_target(sm_arch)
@@ -250,8 +255,12 @@ def compile_cubin(
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = ld_path
         env['PATH'] = bin_path
-        subprocess.run(command, env=env, check=True, capture_output=True)
+        subprocess.run(command, env=env, check=True, capture_output=True, timeout=timeout_sec)
     except subprocess.CalledProcessError as e:
         raise TileCompilerError(e.returncode, e.stderr.decode())
+    except subprocess.TimeoutExpired:
+        message = (f"`tileiras` compiler exceeded timeout {timeout_sec}s. "
+                   "Using a smaller tile size may reduce compilation time.")
+        raise TileCompilerTimeoutError(message)
 
     return fname_cubin

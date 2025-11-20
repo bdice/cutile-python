@@ -7,23 +7,36 @@ import os
 import shutil
 import tempfile
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
 class TileContextConfig:
     temp_dir: str
     log_keys: list[str]
+    compiler_timeout_sec: Optional[int]
 
 
-def init_context_from_env(cls):
+def init_context_config_from_env():
     config = TileContextConfig(
             temp_dir=get_temp_dir_from_env(),
-            log_keys=get_log_keys_from_env()
+            log_keys=get_log_keys_from_env(),
+            compiler_timeout_sec=get_compile_timeout_from_env()
             )
-    return cls(config=config)
+    return config
 
 
-def get_log_keys_from_env():
+def get_compile_timeout_from_env() -> Optional[int]:
+    key = "CUDA_TILE_COMPILER_TIMEOUT_SEC"
+    t = os.environ.get(key)
+    if t is not None:
+        t = int(t)
+        if t <= 0:
+            raise ValueError(f"Value of {key} must be positive")
+    return t
+
+
+def get_log_keys_from_env() -> list[str]:
     KEYS = {"CUTILEIR", "TILEIR"}
     env = os.environ.get('CUDA_TILE_LOGS', "")
     ret = []
@@ -42,7 +55,7 @@ def _clean_tmp_dir(dir: str):
     shutil.rmtree(dir, ignore_errors=True)
 
 
-def get_temp_dir_from_env():
+def get_temp_dir_from_env() -> str:
     dir = os.environ.get('CUDA_TILE_TEMP_DIR', "")
     if dir == "":
         dir = tempfile.mkdtemp()
