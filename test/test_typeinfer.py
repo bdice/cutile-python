@@ -291,3 +291,29 @@ def test_printf_format():
 
     with pytest.raises(TileTypeError, match=r'Too many arguments for format string'):
         compile(too_many_args, ())
+
+
+def kernel_for_loop(x):
+    a = 1
+    for _ in range(10):
+        a *= 2.0
+    ct.store(x, (0,), a)
+
+
+def kernel_while_loop(x):
+    a = 1
+    i = 0
+    while i < 10:
+        a *= 2.0
+        i += 1
+        if i >= 5:
+            break
+    ct.store(x, (0,), a)
+
+
+@pytest.mark.parametrize("kernel", [kernel_for_loop, kernel_while_loop])
+def test_loop_type_mismatch(kernel):
+    x = torch.zeros(1, dtype=torch.float32, device='cuda')
+    msg = re.escape('Type mismatch for loop variable `a`')
+    with pytest.raises(TileTypeError, match=msg):
+        compile(kernel, (x, ))

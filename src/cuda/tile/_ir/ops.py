@@ -393,10 +393,20 @@ class Continue(Operation):
     @override
     def infer_type(self, typing_context: TypingContext) -> TypeResult:
         if self.loop_vars is not None:
-            for var, body_var, result_var in zip(
-                self.next_vars, self.loop_vars.body, self.loop_vars.results
+            for var, initial_var, body_var, result_var in zip(
+                self.next_vars, self.loop_vars.initial, self.loop_vars.body, self.loop_vars.results
             ):
                 var_type = typing_context.get_type(var)
+                if typing_context.typemap.get(initial_var.name, UNDEFINED) is not UNDEFINED:
+                    initial_var_type = typing_context.typemap[initial_var.name]
+                    if initial_var_type != var_type:
+                        original_name = typing_context.ir_ctx.get_original_name(initial_var.name)
+                        raise TileTypeError(
+                            f"Type mismatch for loop variable `{original_name}` with "
+                            f"initialized type {initial_var_type} and computed type {var_type}. "
+                            f"Please change the initial value to match the computed type.",
+                            loc=var.loc
+                        )
                 for dest_var in (body_var, result_var):
                     if typing_context.typemap.get(
                         dest_var.name, UNDEFINED
@@ -444,10 +454,21 @@ class Break(Operation):
     @override
     def infer_type(self, typing_context: TypingContext) -> TypeResult:
         if self.loop_vars is not None:
-            for var, body_var, result_var in zip(
-                self.output_vars, self.loop_vars.body, self.loop_vars.results
+            for var, initial_var, body_var, result_var in zip(
+                self.output_vars, self.loop_vars.initial,
+                self.loop_vars.body, self.loop_vars.results
             ):
                 var_type = typing_context.get_type(var)
+                if typing_context.typemap.get(initial_var.name, UNDEFINED) is not UNDEFINED:
+                    initial_var_type = typing_context.typemap[initial_var.name]
+                    if initial_var_type != var_type:
+                        original_name = typing_context.ir_ctx.get_original_name(initial_var.name)
+                        raise TileTypeError(
+                            f"Type mismatch for loop variable `{original_name}` with "
+                            f"initialized type {initial_var_type} and computed type {var_type}. "
+                            f"Please change the initial value to match the computed type.",
+                            loc=var.loc
+                        )
                 for dest_var in (body_var, result_var):
                     if typing_context.typemap.get(
                         dest_var.name, UNDEFINED
