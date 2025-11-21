@@ -40,11 +40,10 @@ from .op_impl import (
     require_scalar_or_0d_tile_maybe_loose_type)
 from .ops_utils import (
     BINOP_REGISTRY, UNARYOP_REGISTRY,
-    check_dtype_autocast,
     check_rd_and_ftz, PaddingMode,
     rounding_mode_to_bytecode, get_dtype, change_dtype, memory_order_to_bytecode,
     memory_scope_to_bytecode, broadcast_shapes2, is_shape_broadcastable_to, BroadcastError,
-    promote_types, promote_dtypes
+    promote_types, promote_dtypes, check_implicit_cast
 )
 from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval
 from .type import (
@@ -53,7 +52,7 @@ from .type import (
     UNDEFINED, NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy
 )
 from cuda.tile._datatype import (
-    DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float
+    DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float,
 )
 from cuda.tile._ir2bytecode import (
     lower_reduce,
@@ -1953,6 +1952,17 @@ def tile_store(array: Var, index: Var, tile: Var, order: Sequence[int],
                   latency=latency, allow_tma=allow_tma)
 
 
+def _implicit_cast(src: Var, target_dtype: DType, error_context: str) -> Var:
+    ty = require_tile_or_scalar_maybe_loose_type(src)
+    try:
+        check_implicit_cast(ty, target_dtype)
+    except TileTypeError as e:
+        raise TileTypeError(f"{error_context}: {str(e)}")
+    except TileValueError as e:
+        raise TileValueError(f"{error_context}: {str(e)}")
+    return astype(src, target_dtype)
+
+
 @impl(ct.store)
 def tile_store_impl(array: Var, index: Var, tile: Var, order: Var,
                     latency: Var, allow_tma: Var):
@@ -1962,9 +1972,7 @@ def tile_store_impl(array: Var, index: Var, tile: Var, order: Var,
     if array_ty.ndim != index_len:
         raise TileTypeError(f"Index size {index_len} does not match the array rank {array_ty.ndim}")
 
-    src_ty = require_tile_or_scalar_type(tile)
-    src_dtype = get_dtype(src_ty)
-    check_dtype_autocast(src_dtype, array_ty.dtype)
+    tile = _implicit_cast(tile, array_ty.dtype, "Stored tile is incompatible with array's dtype")
 
     order = require_constant_axis_order(order, array_ty.ndim)
     latency = require_optional_constant_int(latency)
@@ -2151,19 +2159,7 @@ def gather_impl(array: Var, indices: Var, padding_value: Var, check_bounds: Var,
                             f" index shape {pointer_ty}")
     array_dtype = array.get_type().dtype
 
-    # HACK: The default value 0 is inferred as int32, which would trigger a type error
-    #       below if the array has a narrower type. So we skip the implicit cast check
-    #       when the value equals the default. Ideally, we'd treat literals in a special way.
-    have_default_padding_value = (padding_value.is_constant()
-                                  and type(padding_const := padding_value.get_constant()) is int
-                                  and padding_const == 0)
-
-    if not have_default_padding_value:
-        padding_dtype = get_dtype(padding_ty)
-        if not datatype.can_autocast_dtypes(padding_dtype, array_dtype):
-            raise TileTypeError(f"Padding value dtype {padding_dtype}"
-                                f" cannot be implicitly cast to the array dtype {array_dtype}")
-    padding_value = astype(padding_value, array_dtype)
+    padding_value = _implicit_cast(padding_value, array_dtype, "Invalid padding value")
     padding_value = broadcast_to(padding_value, pointer_shape)
 
     # Handle the latency hint
@@ -2199,11 +2195,8 @@ def _get_scatter_value(value: Var, pointer_shape: Tuple[int, ...], array_dtype: 
                             f" to the index shape {pointer_shape}")
 
     if cast_dtype:
-        value_dtype = get_dtype(value_ty)
-        if not datatype.can_autocast_dtypes(value_dtype, array_dtype):
-            raise TileTypeError(f"{value_name}'s dtype {value_dtype}"
-                                f" cannot be implicitly cast to the array dtype {array_dtype}")
-        value = astype(value, array_dtype)
+        value = _implicit_cast(value, array_dtype,
+                               "Stored value is incompatible with array's dtype")
     return broadcast_to(value, pointer_shape)
 
 

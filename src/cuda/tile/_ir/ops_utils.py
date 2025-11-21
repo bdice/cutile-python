@@ -208,16 +208,6 @@ def change_dtype(ty: TileTy | datatype.DType | PointerTy,
         return new_dtype
 
 
-def check_dtype_autocast(
-    from_d: datatype.DType,
-    to_d: datatype.DType,
-) -> None:
-    if not datatype.can_autocast_dtypes(from_d, to_d):
-        raise TileTypeError(f"Autocast from value of type {from_d} to "
-                            f"{to_d} is not allowed. "
-                            f"Please perform explicit cast using `astype`.")
-
-
 def check_shapes_eq(a: TileTy, b: TileTy,
                     a_name: str, b_name: str, loc: Loc) -> None:
     if a.shape != b.shape:
@@ -303,6 +293,34 @@ def promote_types(t1: TileTy | DType | LooselyTypedScalar,
         return make_tile_ty(dtype, shape)
     else:
         return dtype
+
+
+def _is_implicit_cast_ok(src_dtype: DType, target_dtype: DType) -> bool:
+    try:
+        common_dtype = _DTypePromotionImpl.promote_dtypes(src_dtype, target_dtype)
+    except TileTypeError:
+        return False
+    return common_dtype == target_dtype
+
+
+def check_implicit_cast(src_ty: TileTy | DType | LooselyTypedScalar, target_dtype: DType):
+    src_dtype = get_dtype(src_ty)
+    if isinstance(src_ty, LooselyTypedScalar):
+        src_cat = NumericDTypeCategories.get_category(src_dtype)
+        dst_cat = NumericDTypeCategories.get_category(target_dtype)
+        if dst_cat == NumericDTypeCategory.Boolean:
+            if src_cat not in (NumericDTypeCategory.Boolean, NumericDTypeCategory.Integral) \
+                    or src_ty.value not in (0, 1):
+                raise TileTypeError(f"cannot implicitly cast {src_ty.value} to {target_dtype}")
+        elif src_cat > dst_cat:
+            raise TileTypeError(f"cannot implicitly cast {src_ty.value} to {target_dtype}")
+        elif src_cat == dst_cat == NumericDTypeCategory.Integral:
+            min, max = datatype.get_int_min_max(target_dtype)
+            if not (min <= src_ty.value <= max):
+                raise TileValueError(f"{src_ty.value} is out of range of {target_dtype}")
+    else:
+        if not _is_implicit_cast_ok(src_dtype, target_dtype):
+            raise TileTypeError(f"cannot implicitly cast {src_dtype} to {target_dtype}")
 
 
 class BroadcastError(Exception):

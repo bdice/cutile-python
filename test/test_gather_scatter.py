@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
+import math
 import re
 
 import pytest
@@ -9,10 +10,11 @@ import numpy as np
 
 from math import ceil
 import cuda.tile as ct
-from cuda.tile import _datatype as datatype
+from cuda.tile import TileValueError
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._exception import TileTypeError
 from cuda.tile._ir.ops import LoadPointerTokenOrdered, StorePointerTokenOrdered
+from cuda.tile._ir.ops_utils import _is_implicit_cast_ok
 from cuda.tile._ir.typing_support import to_dtype
 from cuda.tile._compile import compile_tile
 from util import assert_equal, raises_if
@@ -38,8 +40,8 @@ def test_array_copy_1d(shape, x_dtype, y_dtype, tile):
     y = torch.zeros_like(x, dtype=y_dtype)
     grid = (ceil(shape[0] / tile), 1, 1)
 
-    invalid_cast = not datatype.can_autocast_dtypes(to_dtype(x_dtype), to_dtype(y_dtype))
-    msg = "cannot be implicitly cast to the array dtype"
+    invalid_cast = not _is_implicit_cast_ok(to_dtype(x_dtype), to_dtype(y_dtype))
+    msg = "cannot implicitly cast"
     with raises_if(invalid_cast, TileTypeError, match=re.escape(msg)):
         ct.launch(torch.cuda.current_stream(), grid, array_copy_1d, (x, y, tile))
         assert_equal(x.to(y.dtype), y)
@@ -64,8 +66,8 @@ def test_array_copy_2d(shape, x_dtype, y_dtype, tile):
     y = torch.zeros_like(x, dtype=y_dtype)
     grid = (*(ceil(i / j) for i, j in zip(shape, tile)), 1)
 
-    invalid_cast = not datatype.can_autocast_dtypes(to_dtype(x_dtype), to_dtype(y_dtype))
-    msg = "cannot be implicitly cast to the array dtype"
+    invalid_cast = not _is_implicit_cast_ok(to_dtype(x_dtype), to_dtype(y_dtype))
+    msg = "cannot implicitly cast"
     with raises_if(invalid_cast, TileTypeError, match=re.escape(msg)):
         ct.launch(torch.cuda.current_stream(), grid, array_copy_2d,
                   (x, y, tile[0], tile[1]))
@@ -86,17 +88,43 @@ def test_scalar_copy():
 
 
 @ct.kernel
-def custom_padding_constant(x, y):
+def custom_padding_constant(x, y, pad_val: ct.Constant[int | float]):
     ind = ct.arange(8, dtype=ct.int32)
-    t = ct.gather(x, ind, padding_value=7)
+    t = ct.gather(x, ind, padding_value=pad_val)
     ct.scatter(y, ind, t)
 
 
-def test_custom_padding_constant():
+@pytest.mark.parametrize("pad_val", [7, 7.0, math.inf, -math.inf])
+def test_custom_padding_constant(pad_val):
     x = torch.arange(100, 106, dtype=torch.float32, device="cuda")
     y = torch.zeros(8, dtype=torch.float32, device="cuda")
-    ct.launch(torch.cuda.current_stream(), (1,), custom_padding_constant, (x, y))
-    assert y.cpu().tolist() == [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 7.0, 7.0]
+    ct.launch(torch.cuda.current_stream(), (1,), custom_padding_constant, (x, y, pad_val))
+    assert y.cpu().tolist() == [
+        100.0, 101.0, 102.0, 103.0, 104.0, 105.0, float(pad_val), float(pad_val)
+    ]
+
+
+def test_padding_value_out_of_range():
+    x = torch.arange(100, 106, dtype=torch.int8, device="cuda")
+    y = torch.zeros(8, dtype=torch.int32, device="cuda")
+    with pytest.raises(TileValueError, match="128 is out of range"):
+        ct.launch(torch.cuda.current_stream(), (1,), custom_padding_constant, (x, y, 128))
+
+
+@ct.kernel
+def literal_negative_infinity_padding(x, y):
+    ind = ct.arange(8, dtype=ct.int32)
+    t = ct.gather(x, ind, padding_value=-math.inf)
+    ct.scatter(y, ind, t)
+
+
+def test_literal_negative_infinity_padding():
+    x = torch.arange(100, 106, dtype=torch.float32, device="cuda")
+    y = torch.zeros(8, dtype=torch.float32, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (1,), literal_negative_infinity_padding, (x, y))
+    assert y.cpu().tolist() == [
+        100.0, 101.0, 102.0, 103.0, 104.0, 105.0, -math.inf, -math.inf
+    ]
 
 
 @ct.kernel

@@ -9,7 +9,9 @@ import pytest
 from math import ceil
 import cuda.tile as ct
 from conftest import float_dtypes, bool_dtypes, int_dtypes, dtype_id
-from util import assert_close, assert_equal, filecheck, raises_autocast_error, get_bytecode
+from cuda.tile._ir.ops_utils import _is_implicit_cast_ok
+from cuda.tile._ir.typing_support import to_dtype
+from util import assert_close, assert_equal, filecheck, get_bytecode
 from torch.testing import make_tensor
 
 
@@ -121,7 +123,7 @@ def array_copy_1d(x, y, TILE: ct.Constant[int]):
 @pytest.mark.parametrize("tile", [64, 128])
 @pytest.mark.parametrize("x_dtype", float_dtypes+int_dtypes+bool_dtypes, ids=dtype_id)
 @pytest.mark.parametrize("y_dtype", float_dtypes+int_dtypes+bool_dtypes, ids=dtype_id)
-def test_array_copy_dtype_autocast(shape, tile, x_dtype, y_dtype):
+def test_array_copy_dtype_implicit_cast(shape, tile, x_dtype, y_dtype):
     x = make_tensor(shape, dtype=x_dtype, device='cuda')
     y = torch.zeros_like(x, dtype=y_dtype, device='cuda')
     grid = (ceil(shape[0] / tile), 1, 1)
@@ -129,7 +131,7 @@ def test_array_copy_dtype_autocast(shape, tile, x_dtype, y_dtype):
     def launch():
         ct.launch(torch.cuda.current_stream(), grid, array_copy_1d, (x, y, tile))
 
-    if not raises_autocast_error(launch, x_dtype, y_dtype):
+    if _is_implicit_cast_ok(to_dtype(x_dtype), to_dtype(y_dtype)):
         launch()
         assert_equal(y, x.to(y.dtype))
 

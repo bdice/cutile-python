@@ -10,8 +10,8 @@ import torch
 from torch.testing import make_tensor
 
 import cuda.tile as ct
-from cuda.tile import _datatype as datatype
 from cuda.tile._exception import TileTypeError
+from cuda.tile._ir.ops_utils import _is_implicit_cast_ok
 from cuda.tile._ir.typing_support import to_dtype
 from util import (
     assert_equal, filecheck, get_int_dtype_of_same_size, jit_kernel,
@@ -134,8 +134,8 @@ def test_atomic_arith(op_name, torch_op, x_dtype, y_dtype, tmp_path, mode):
         def launch():
             ct.launch(torch.cuda.current_stream(), grid, kernel, (x, y, z))
 
-    invalid_cast = not datatype.can_autocast_dtypes(to_dtype(y_dtype), to_dtype(x_dtype))
-    msg = "cannot be implicitly cast to the array dtype"
+    invalid_cast = not _is_implicit_cast_ok(to_dtype(y_dtype), to_dtype(x_dtype))
+    msg = "cannot implicitly cast"
     with raises_if(invalid_cast, TileTypeError, match=re.escape(msg)):
         ref_x, ref_z = ref_atomic_arith(x, y, torch_op)
         launch()
@@ -249,8 +249,8 @@ def test_atomic_cas(x_dtype, y_dtype, mode):
         def launch():
             ct.launch(torch.cuda.current_stream(), grid, scalar_atomic_cas, (x, y, z))
 
-    invalid_cast = not datatype.can_autocast_dtypes(to_dtype(y_dtype), to_dtype(x_dtype))
-    msg = "cannot be implicitly cast to the array dtype"
+    invalid_cast = not _is_implicit_cast_ok(to_dtype(y_dtype), to_dtype(x_dtype))
+    msg = "cannot implicitly cast"
     with raises_if(invalid_cast, TileTypeError, match=re.escape(msg)):
         ref_x, ref_z = ref_atomic_cas(x, y)
         launch()

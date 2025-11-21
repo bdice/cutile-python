@@ -382,23 +382,6 @@ def get_int_min_max(t: DType) -> Tuple[int, int]:
         return 0, (1 << t.bitwidth) - 1
 
 
-# TODO: bitwidth now is presenting the storage size, bool is 8-bit.
-# When we compare bool and subbyte dtype like int4 later, we need to change this.
-def can_autocast_dtypes(from_d: DType, to_d: DType) -> bool:
-    if from_d == to_d:
-        return True
-
-    if is_restricted_arithmetic(from_d) or is_restricted_arithmetic(to_d):
-        return False
-
-    k1, k2 = NumericDTypeCategories.get_category(from_d), NumericDTypeCategories.get_category(to_d)
-    if k1 == k2:
-        # same category allowed if signedness is the same and not narrowing, lose range or precision
-        return (is_signed(from_d) == is_signed(to_d)) and (from_d.bitwidth < to_d.bitwidth)
-    else:
-        return k1 < k2
-
-
 _mma_supported_dtypes = {
     float8_e4m3fn: (float16, float32),
     float8_e5m2: (float16, float32),

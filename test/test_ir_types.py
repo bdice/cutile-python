@@ -16,9 +16,8 @@ from cuda.tile._datatype import (
     uint64, uint32, uint16, uint8, bfloat16,
     tfloat32, float8_e4m3fn, float8_e5m2,
     is_boolean, is_integral, is_float, is_restricted_float, is_signed,
-    can_autocast_dtypes
 )
-from cuda.tile._ir.ops_utils import promote_dtypes
+from cuda.tile._ir.ops_utils import promote_dtypes, check_implicit_cast
 from cuda.tile._ir.typing_support import to_dtype, typeof_pyval
 import torch
 import numpy as np
@@ -149,47 +148,97 @@ def test_promote_dtypes():
     assert_out_of_range(int8, LooselyTypedScalar(128))
 
 
-def test_autocast_dtypes():
+def test_check_implicit_cast():
 
-    def allow(small_t, big_t):
-        assert can_autocast_dtypes(small_t, big_t)
-        if small_t != big_t:
-            assert not can_autocast_dtypes(big_t, small_t)
+    def allow(src, dst):
+        check_implicit_cast(src, dst)
 
-    def disallow(t1, t2):
-        assert not can_autocast_dtypes(t1, t2)
-        assert not can_autocast_dtypes(t2, t1)
+    def disallow(src, dst):
+        with pytest.raises((TileTypeError, TileValueError)):
+            check_implicit_cast(src, dst)
 
     # same category
     allow(int8, int8)
-    allow(int8, int16)
     allow(uint8, uint8)
+
+    allow(int8, int16)
+    disallow(int16, int8)
+
     allow(uint8, uint16)
+    disallow(uint16, uint8)
+
     allow(float16, float32)
+    disallow(float32, float16)
+
     allow(bfloat16, float32)
+    disallow(float32, bfloat16)
+
     disallow(float16, bfloat16)
+    disallow(bfloat16, float16)
 
     # bool -> int or float
     allow(bool_, int32)
+    disallow(int32, bool_)
+
     allow(bool_, uint32)
+    disallow(uint32, bool_)
+
     allow(bool_, float32)
+    disallow(float32, bool_)
+
     allow(bool_, bfloat16)
+    disallow(bfloat16, bool_)
+
     disallow(bool_, tfloat32)
+    disallow(tfloat32, bool_)
+
     disallow(bool_, float8_e5m2)
+    disallow(float8_e5m2, bool_)
 
     # int -> float
     allow(uint32, float16)
+    disallow(float16, uint32)
+
     allow(int32, float16)
+    disallow(float16, int32)
+
     disallow(uint32, tfloat32)
+    disallow(tfloat32, uint32)
+
     disallow(uint32, float8_e5m2)
+    disallow(float8_e5m2, uint32)
+
     disallow(int32, tfloat32)
+    disallow(tfloat32, int32)
+
     disallow(int32, float8_e5m2)
+    disallow(float8_e5m2, int32)
 
     # signed <> unsigned not allowed
     disallow(int32, uint32)
+    disallow(uint32, int32)
+
     # restricted float not allowed
     disallow(float32, tfloat32)
+    disallow(tfloat32, float32)
+
     disallow(float8_e5m2, tfloat32)
+    disallow(tfloat32, float8_e5m2)
+
+    # Loosely typed scalars
+    allow(LooselyTypedScalar(10), int8)
+    disallow(LooselyTypedScalar(128), int8)
+
+    allow(LooselyTypedScalar(10), float32)
+    allow(LooselyTypedScalar(4.0), float32)
+    allow(LooselyTypedScalar(4.0), float16)
+
+    allow(LooselyTypedScalar(False), bool_)
+    allow(LooselyTypedScalar(True), bool_)
+    allow(LooselyTypedScalar(1), bool_)
+    allow(LooselyTypedScalar(0), bool_)
+    disallow(LooselyTypedScalar(1.0), bool_)
+    disallow(LooselyTypedScalar(0.0), bool_)
 
 
 def test_np_dtype_support():
