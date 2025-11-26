@@ -11,12 +11,12 @@ from dataclasses import dataclass
 from types import FunctionType
 from typing import Tuple, Any, Optional, Sequence, Callable
 
-from cuda.tile._debug import CUDA_TILE_LOGS
 from cuda.tile._exception import (
     TileTypeError,
     TileInternalError,
     ConstantNotFoundError, TileSyntaxError, Loc, TileError
 )
+from cuda.tile._cext import TileContext
 from cuda.tile._ir import ir
 from cuda.tile._ir.ir import Operation, Function, Block, Var, Argument, IRContext, TypedOperation
 from cuda.tile._ir.op_impl import op_implementations
@@ -359,12 +359,15 @@ def infer_types_in_func(context: TypingContext,
     return dataclasses.replace(func, parameters=tuple(new_params))
 
 
-def infer_types_pass(func: Function, args: Tuple[Argument, ...], pyfunc: FunctionType) -> Function:
+def infer_types_pass(func: Function,
+                     args: Tuple[Argument, ...],
+                     pyfunc: FunctionType,
+                     tile_context: TileContext) -> Function:
     context = TypingContext(func.root_block.ctx)
     try:
         return infer_types_in_func(context, func, args)
     except Exception as e:
-        if 'CUTILEIR' in CUDA_TILE_LOGS:
+        if 'CUTILEIR' in tile_context.config.log_keys:
             highlight_loc = e.loc if hasattr(e, 'loc') else None
             code = (f"====Partial CuTile IR for {func}==== \n\n"
                     f"{func.to_string(highlight_loc=highlight_loc)}\n\n")

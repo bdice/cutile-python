@@ -94,14 +94,17 @@ class TileError(Exception):
 
 
 class TileSyntaxError(TileError):
+    """Exception when a python syntax not supported by cuTile is encountered."""
     pass
 
 
 class TileTypeError(TileError):
+    """Exception when an unexpected type or |data type| is encountered."""
     pass
 
 
 class TileValueError(TileError):
+    """Exception when an unexpected python value is encountered."""
     pass
 
 
@@ -167,6 +170,7 @@ class TileCompilerError(TileInternalError):
 
 
 class TileCompilerExecutionError(TileCompilerError):
+    """Exception when ``tileiras`` compiler throws an error."""
     def __init__(self,
                  return_code: int,
                  stderr: str,
@@ -180,6 +184,7 @@ class TileCompilerExecutionError(TileCompilerError):
 
 
 class TileCompilerTimeoutError(TileCompilerError):
+    """Exception when ``tileiras`` compiler timeout limit is exceeded."""
     def __init__(self,
                  message: str,
                  compiler_flags: str,

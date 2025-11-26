@@ -8,11 +8,12 @@ import cuda.tile as ct
 from cuda.tile._ir.ops import Loop, Continue, Break
 from cuda.tile._ir import ir
 from cuda.tile._compile import _get_final_ir
+from cuda.tile._cext import default_tile_context
 
 
 def get_ir(func) -> ir.Function:
     x = torch.zeros(10, device="cuda")
-    ir = _get_final_ir(func, (x,))
+    ir = _get_final_ir(func, (x,), default_tile_context)
     print(ir)
     return ir
 

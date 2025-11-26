@@ -44,3 +44,4 @@ latest hardware features without having to rewrite your code.
    interoperability
    performance
    operations
+   debugging
