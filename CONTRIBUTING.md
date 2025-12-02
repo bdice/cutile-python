@@ -7,7 +7,7 @@
 If you are interested in contributing to cuTile, your contributions will fall
 into three categories:
 1. You want to report a bug, feature request, or documentation issue
-    - File an [issue](https://github.com/nvidia/cutile/issues/new/choose)
+    - File an [issue](https://github.com/nvidia/cutile-python/issues/new/choose)
     describing what you encountered or what you want to see changed.
     - The cuTile team will evaluate the issues and triage them, scheduling
     them for a release. If you believe the issue needs priority attention
@@ -24,32 +24,34 @@ into three categories:
 
 ## Code contributions
 
+Code contribution is currently not open until we establish our Github CI. Please stay tuned.
+
 ### Your first issue
 
-1. Read the project's [README.md](https://github.com/nvidia/cutile/blob/main/README.md)
+1. Read the project's [README.md](https://github.com/nvidia/cutile-python/blob/main/README.md)
     to learn how to setup the development environment.
-2. Find an issue to work on. The best way is to look for the [good first issue](https://github.com/nvidia/cutile/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
-    or [help wanted](https://github.com/nvidia/cutile/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) labels
+2. Find an issue to work on. The best way is to look for the [good first issue](https://github.com/nvidia/cutile-python/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+    or [help wanted](https://github.com/nvidia/cutile-python/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) labels
 3. Comment on the issue saying you are going to work on it.
-4. Get familar with the developer guide relevant for you:
-    * For C++ developers it is available here TBD
-    * For Python developers, it is available here TBD
-5. Code! Make sure to update unit tests!
-6. When done, [create your pull request](https://github.com/nvidia/cutile/compare).
-7. Verify that CI passes all [status checks](https://help.github.com/articles/about-status-checks/), or fix if needed.
-8. Wait for other developers to review your code and update code as needed.
-9. Once reviewed and approved, a cuTile developer will merge your pull request.
+4. Code! Make sure to update unit tests!
+5. When done, [create your pull request](https://github.com/nvidia/cutile-python/compare).
+6. Verify that CI passes all [status checks](https://help.github.com/articles/about-status-checks/), or fix if needed.
+7. Wait for other developers to review your code and update code as needed.
+8. Once reviewed and approved, a cuTile developer will merge your pull request.
 
-Remember, if you are unsure about anything, don't hesitate to comment on issues and ask for clarifications!
+If you are unsure about anything, don't hesitate to comment on issues and ask for clarifications!
 
 ### Managing PR labels
 
-Each PR must be labeled according to whether it is a "breaking" or "non-breaking" change (using Github labels). This is used to highlight changes that users should know about when upgrading.
+Each PR must be labeled according to whether it is a "breaking" or
+"non-breaking" change (using Github labels). This is used to highlight changes
+that users should know about when upgrading.
 
 For cuTile, a "breaking" change is one that modifies the public, non-experimental, Python API in a
 non-backward-compatible way.
 
-Additional labels must be applied to indicate whether the change is a feature, improvement, bugfix, or documentation change.
+Additional labels must be applied to indicate whether the change is a feature,
+improvement, bugfix, or documentation change.
 
 ### Seasoned developers
 
@@ -66,11 +68,9 @@ implementation of the issue, ask them in the issue instead of the PR.
 
 ### Branches and Versions
 
-TBD
-
 ### Branch naming
 
-Branches used to create PRs should have a name of the form `<type>-<name>`
+Branches used to create PRs should have a name of the form `<username>/<type>-<name>`
 which conforms to the following conventions:
 - Type:
     - fea - For if the branch is for a new feature(s)
