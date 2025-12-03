@@ -23,8 +23,8 @@ def split_ge_kernel(x):
 
 def test_split_ge():
     x = torch.zeros(10, dtype=torch.int32, device="cuda")
-    ir = compile_tile(split_ge_kernel._pyfunc, (x,), CompilerOptions()).final_ir
-    loop_ops = [op for op in ir.root_block.traverse() if isinstance(op, Loop)]
+    root_block = compile_tile(split_ge_kernel._pyfunc, (x,), CompilerOptions()).final_ir
+    loop_ops = [op for op in root_block.traverse() if isinstance(op, Loop)]
     assert len(loop_ops) == 2
 
     ct.launch(torch.cuda.current_stream(), (1,), split_ge_kernel, (x,))

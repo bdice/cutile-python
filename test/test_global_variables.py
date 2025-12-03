@@ -52,7 +52,7 @@ def test_kernel_read_before_assignment():
     y = make_tensor(shape, dtype=torch.float32, device='cuda')
     z = torch.zeros_like(x)
     grid = (ceil(shape[0] / global_int), 1, 1)
-    with pytest.raises(TileSyntaxError, match=r"Uninitialized variable"):
+    with pytest.raises(TileSyntaxError, match=r"Undefined variable"):
         ct.launch(torch.cuda.current_stream(), grid, kernel_read_before_assignment, (x, y, z))
 
 

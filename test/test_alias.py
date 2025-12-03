@@ -33,9 +33,8 @@ def while_loop_alias(X, Y, n: int, TILE: ct.Constant[int]):
 
 
 def nested_alias(X, Y, n: int, TILE: ct.Constant[int]):
-    if n > 100:
-        alias = X
-    else:
+    alias = X
+    if n <= 100:
         for i in range(n):
             alias = Y
     ct.store(alias, index=(0,), tile=ct.full((TILE,), 3, dtype=X.dtype))
@@ -47,9 +46,8 @@ def tuple_alias(X, Y, n: int, TILE: ct.Constant[int]):
 
 
 def nested_tuple_alias(X, Y, n: int, TILE: ct.Constant[int]):
-    if n > 100:
-        t = (X, Y)
-    else:
+    t = (X, Y)
+    if n <= 100:
         i = 0
         while i < n:
             t = (Y, X)

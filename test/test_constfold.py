@@ -192,6 +192,7 @@ def test_fold_if_calling_function_with_function_call():
 def test_dtype_in_for_loop():
 
     def kernel():
+        dtype = ct.float16
         for i in range(5):
             dtype = ct.float16
         ct.full((1, 1), 1.0, dtype=dtype)

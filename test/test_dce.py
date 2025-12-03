@@ -11,7 +11,7 @@ from cuda.tile._compile import _get_final_ir
 from cuda.tile._cext import default_tile_context
 
 
-def get_ir(func) -> ir.Function:
+def get_ir(func) -> ir.Block:
     x = torch.zeros(10, device="cuda")
     ir = _get_final_ir(func, (x,), default_tile_context)
     print(ir)
@@ -27,9 +27,9 @@ def test_unused_loop_var():
             t = t + 1
         ct.store(x, (1,), t)
 
-    func_ir = get_ir(kernel)
-    loop, = [op for op in func_ir.root_block if isinstance(op, Loop)]
-    assert list(loop.carried_vars.names) == ["t"]
+    func_body = get_ir(kernel)
+    loop, = [op for op in func_body if isinstance(op, Loop)]
+    assert [v.get_original_name() for v in loop.body_vars] == ["t"]
 
 
 def test_unused_body_var():
@@ -44,12 +44,12 @@ def test_unused_body_var():
             i = i + 1
         ct.store(x, (1,), t)
 
-    func_ir = get_ir(kernel)
-    loop, = [op for op in func_ir.root_block if isinstance(op, Loop)]
+    func_body = get_ir(kernel)
+    loop, = [op for op in func_body if isinstance(op, Loop)]
 
     # The initial variable should be undefined because it is never used
-    t_idx = loop.carried_vars.names.index("t")
-    assert loop.carried_vars.initial[t_idx].is_undefined()
+    t_idx = [v.get_original_name() for v in loop.result_vars].index("t")
+    assert loop.initial_values[t_idx].is_undefined()
 
     # The yielded variable should also be undefined because it is never used
     continue_op = loop.body[-1]
@@ -69,10 +69,10 @@ def test_unused_result_var():
                 break
             i = i + 1
 
-    func_ir = get_ir(kernel)
-    loop, = [op for op in func_ir.root_block if isinstance(op, Loop)]
+    func_body = get_ir(kernel)
+    loop, = [op for op in func_body if isinstance(op, Loop)]
 
     # The value yielded by "break" should be undefined
-    t_idx = loop.carried_vars.names.index("t")
-    break_op, = [op for op in func_ir.root_block.traverse() if isinstance(op, Break)]
+    t_idx = [v.get_original_name() for v in loop.body_vars].index("t")
+    break_op, = [op for op in func_body.traverse() if isinstance(op, Break)]
     assert break_op.output_vars[t_idx].is_undefined()

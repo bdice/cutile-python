@@ -3,16 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from cuda.tile._ir.ir import Block, Function, Var
+from cuda.tile._ir.ir import Block, Var
 from cuda.tile._ir.ops import Loop, IfElse, Continue, Break, EndBranch, Return
 
 from dataclasses import dataclass
 import enum
 
 
-def hoist_loop_invariants(func_ir: Function):
-    def_depth = {p.name: 0 for p in func_ir.parameters}
-    _hoist(func_ir.root_block, [], def_depth, False)
+def hoist_loop_invariants(root_block: Block):
+    def_depth = {p.name: 0 for p in root_block.params}
+    _hoist(root_block, [], def_depth, False)
 
 
 # Indicates whether a block could in theory be moved, based purely on the classes of operations
@@ -73,7 +73,7 @@ class _StackItem:
 def _hoist(block: Block, stack: list[_StackItem], def_depth: dict[str, int], is_loop_body: bool) \
         -> _BlockResult:
     depth = len(stack)
-    new_block = Block(block.ctx)
+    new_block = block.empty_like_self()
     stack.append(_StackItem(new_block, is_loop_body))
     ret = _BlockResult()
 
@@ -82,9 +82,7 @@ def _hoist(block: Block, stack: list[_StackItem], def_depth: dict[str, int], is_
         depinfo = _DependencyInfo(must_stay=not is_loop_body)
 
         if isinstance(op, Loop):
-            if op.for_loop is not None:
-                def_depth[op.for_loop.induction_var.name] = depth + 1
-            for var in op.carried_vars.body:
+            for var in op.body.params:
                 def_depth[var.name] = depth + 1
 
             body_res = _hoist(op.body, stack, def_depth, True)
@@ -93,7 +91,7 @@ def _hoist(block: Block, stack: list[_StackItem], def_depth: dict[str, int], is_
                 ret.mobility = _BlockMobility.IMMOVABLE
                 depinfo.must_stay = True
 
-            for v in op.carried_vars.initial:
+            for v in op.initial_values:
                 depinfo.update(_get_def_depth(def_depth, v), depth)
             depinfo.update(body_res.min_depth, depth)
         elif isinstance(op, IfElse):

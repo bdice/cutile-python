@@ -11,10 +11,10 @@ from typing import Tuple, Dict, Set, Optional
 from cuda.tile._ir.type import TupleTy, TokenTy
 from cuda.tile._memory_model import MemoryOrder
 from cuda.tile._exception import Loc
-from cuda.tile._ir.ir import Function, Block, IRContext, Var, Operation
+from cuda.tile._ir.ir import Block, IRContext, Var, Operation
 from cuda.tile._ir.ops import (
-    Assign, Break, BuildTuple, CarriedVariables, Continue, EndBranch, IfElse,
-    IfElseResults, JoinTokens, LoadMemoryOperation, Loop, MakeToken,
+    Assign, Break, BuildTuple, Continue, EndBranch, IfElse,
+    JoinTokens, LoadMemoryOperation, Loop, MakeToken,
     MemoryOperation, Range, StoreMemoryOperation, TileAtomicCAS, TileAtomicCASTokenOrdered,
     TileAtomicRMW, TileAtomicRMWTokenOrdered, LoadPointer, LoadPointerTokenOrdered,
     TileLoad, TileLoadTokenOrdered, StorePointer, StorePointerTokenOrdered,
@@ -87,13 +87,11 @@ TokenKey = AliasTokenKey | AcquireTokenKeyClass
 
 @dataclass(frozen=True)
 class IfElseInfo:
-    ifelse_results: IfElseResults
     ifelse_mem_effects: MemoryEffects
 
 
 @dataclass(frozen=True)
 class InnermostLoopInfo:
-    loop_vars: CarriedVariables
     loop_mem_effects: MemoryEffects
     # TODO: remove once parallel loop store no longer depends on these two
     loop_parallel_stores: Set[Operation]
@@ -123,17 +121,17 @@ _TOKEN_ORDERED_OP_MAP = {
 }
 
 
-def token_order_pass(func: Function, alias_result: AliasResult):
+def token_order_pass(root_block: Block, alias_result: AliasResult):
     block_memory_effects = {}
-    _get_block_memory_effects(func.root_block, alias_result, block_memory_effects)
-    var_info = _get_var_info(func.root_block)
+    _get_block_memory_effects(root_block, alias_result, block_memory_effects)
+    var_info = _get_var_info(root_block)
     context = TokenOrderContext(alias_result, var_info, block_memory_effects)
 
-    root_tok = _make_token_var(func.root_block.ctx, func.loc)
+    root_tok = _make_token_var(root_block.ctx, root_block.loc)
     token_map = defaultdict(lambda: root_tok)
-    _to_token_order_in_block(func.root_block, context, token_map)
+    _to_token_order_in_block(root_block, context, token_map)
     # Ensures Operation.parent_block is correctly set
-    func.root_block[:0] = (MakeToken(root_tok, func.loc),)
+    root_block[:0] = (MakeToken(root_tok, root_block.loc),)
 
 
 def _get_input_var(op: Operation):
@@ -272,18 +270,16 @@ def _to_token_order_in_block(block: Block,
         elif isinstance(op, Loop):
             body_mem_effects = context.block_memory_effects[op.body]
 
-            new_loop_vars = CarriedVariables(
-                list(op.carried_vars.names), list(op.carried_vars.initial),
-                list(op.carried_vars.body), list(op.carried_vars.results)
-            )
+            new_initial_values = list(op.initial_values)
+            new_body_params = list(op.body.params)
+            new_result_vars = list(op.result_vars)
 
             def append_new_carried_var(init_var: Var):
-                new_loop_vars.names.append(init_var.name)
-                new_loop_vars.initial.append(init_var)
+                new_initial_values.append(init_var)
                 body_var = _make_token_var(block.ctx, op.loc)
-                new_loop_vars.body.append(body_var)
+                new_body_params.append(body_var)
                 res_var = _make_token_var(block.ctx, op.loc)
-                new_loop_vars.results.append(res_var)
+                new_result_vars.append(res_var)
                 return body_var, res_var
 
             result_token_map = token_map.copy()
@@ -314,12 +310,13 @@ def _to_token_order_in_block(block: Block,
 
             _to_token_order_in_block(op.body, context, body_token_map,
                                      ifelse_info=None,
-                                     innermost_loop_info=InnermostLoopInfo(new_loop_vars,
-                                                                           body_mem_effects,
+                                     innermost_loop_info=InnermostLoopInfo(body_mem_effects,
                                                                            parallel_stores,
                                                                            token_map))
 
-            new_loop_op = Loop(op.body, op.loc, op.for_loop, new_loop_vars)
+            op.body.params = tuple(new_body_params)
+            new_loop_op = Loop(op.iterable, tuple(new_initial_values), tuple(new_result_vars),
+                               op.body, op.loc)
             operations.append(new_loop_op)
 
             token_map = result_token_map
@@ -327,16 +324,13 @@ def _to_token_order_in_block(block: Block,
         elif isinstance(op, Continue):
             tokens = _get_cf_exit_tokens(innermost_loop_info.loop_mem_effects, token_map)
 
-            new_continue_op = Continue(op.loc, tuple(op.next_vars) + tokens,
-                                       innermost_loop_info.loop_vars,
-                                       op.is_for_loop_body)
+            new_continue_op = Continue(op.loc, tuple(op.next_vars) + tokens)
             operations.append(new_continue_op)
 
         elif isinstance(op, Break):
             tokens = _get_cf_exit_tokens(innermost_loop_info.loop_mem_effects, token_map)
 
-            new_break_op = Break(op.loc, tuple(op.output_vars) + tokens,
-                                 innermost_loop_info.loop_vars)
+            new_break_op = Break(op.loc, tuple(op.output_vars) + tokens)
             operations.append(new_break_op)
 
         elif isinstance(op, IfElse):
@@ -346,12 +340,11 @@ def _to_token_order_in_block(block: Block,
             merged_mem_effects = then_mem_effects | else_mem_effects
 
             result_token_map = token_map.copy()
-            new_res = IfElseResults(list(op.results.names), list(op.results.vars))
+            new_result_vars = list(op.result_vars)
 
             def add_new_ifelse_result():
                 x = _make_token_var(block.ctx, op.loc)
-                new_res.names.append(x.name)
-                new_res.vars.append(x)
+                new_result_vars.append(x)
                 return x
 
             for alias_set, effect in merged_mem_effects.items():
@@ -375,9 +368,9 @@ def _to_token_order_in_block(block: Block,
             for nested_block in op.nested_blocks:
                 _to_token_order_in_block(nested_block, context, token_map.copy(),
                                          innermost_loop_info=innermost_loop_info,
-                                         ifelse_info=IfElseInfo(new_res, merged_mem_effects))
+                                         ifelse_info=IfElseInfo(merged_mem_effects))
 
-            new_ifelse_op = IfElse(op.cond, op.then_block, op.else_block, op.loc, new_res)
+            new_ifelse_op = IfElse(op.cond, op.then_block, op.else_block, new_result_vars, op.loc)
             operations.append(new_ifelse_op)
 
             token_map = result_token_map
@@ -385,8 +378,7 @@ def _to_token_order_in_block(block: Block,
         elif isinstance(op, EndBranch):
             tokens = _get_cf_exit_tokens(ifelse_info.ifelse_mem_effects, token_map)
 
-            new_end_branch_op = EndBranch(op.loc, tuple(op.outputs) + tokens,
-                                          ifelse_info.ifelse_results)
+            new_end_branch_op = EndBranch(op.loc, tuple(op.outputs) + tokens)
             operations.append(new_end_branch_op)
 
         else:
@@ -502,7 +494,7 @@ def _get_parallel_stores(
     Common in LayerNorm and RMSNorm patterns.
     """
 
-    if loop_op.for_loop is None:
+    if loop_op.iterable is None:
         return set()
 
     # Skips this optimization if alias_set size > 1 is present in the loop body
@@ -554,8 +546,8 @@ def _filter_by_store_index(loop_op: Loop,
 
     def is_idx_injective(idx_var: Var) -> bool:
         root_idx_var = var_info.root_var.get(idx_var.name, idx_var.name)
-        if loop_op.for_loop and root_idx_var == loop_op.for_loop.induction_var.name:
-            iterable = loop_op.for_loop.iterable.name
+        if loop_op.iterable is not None and root_idx_var == loop_op.induction_var.name:
+            iterable = loop_op.iterable.name
             iterable = var_info.root_var.get(iterable, iterable)
             return isinstance(var_info.defining_op.get(iterable), Range)
         # TODO: allow more complex injective check: j = i * 2 + 3

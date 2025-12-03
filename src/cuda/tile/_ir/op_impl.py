@@ -18,7 +18,8 @@ from cuda.tile._ir.ops_utils import get_dtype
 from .ir import Var
 from .typing_support import get_signature
 from .type import TupleTy, TileTy, DTypeSpec, EnumTy, StringTy, ArrayTy, SliceType, \
-    ListTy, PointerTy, LooselyTypedScalar
+    ListTy, PointerTy, LooselyTypedScalar, RangeIterType
+from .. import _datatype
 
 
 def _verify_params_match(stub_sig: inspect.Signature, func_sig: inspect.Signature):
@@ -138,6 +139,15 @@ def require_optional_constant_enum(var: Var, enum: EnumMeta):
     return require_constant_enum(var, enum)
 
 
+def require_optional_range_type(var: Var) -> RangeIterType | None:
+    if var.is_constant() and var.get_constant() is None:
+        return None
+    ty = var.get_type()
+    if not isinstance(ty, RangeIterType):
+        raise _make_type_error(f"Expected a range object, but given value has type {ty}", var)
+    return ty
+
+
 def require_constant_enum(var: Var, enum: EnumMeta):
     if not var.is_constant():
         raise _make_type_error(f"Expected {enum.__name__} constant,"
@@ -254,6 +264,14 @@ def require_scalar_or_0d_tile_type(var: Var) -> TileTy | DType | PointerTy:
     if not (isinstance(ty, DType | PointerTy) or (isinstance(ty, TileTy) and ty.ndim == 0)):
         raise _make_type_error(f"Expected a scalar or a 0D tile, but given value has type {ty}",
                                var)
+    return ty
+
+
+def require_bool(var: Var) -> TileTy | DType:
+    ty = var.get_type()
+    if not (ty == _datatype.bool_
+            or (isinstance(ty, TileTy) and ty.ndim == 0 and ty.dtype == _datatype.bool_)):
+        raise _make_type_error(f"Expected a bool, but given value has type {ty}", var)
     return ty
 
 

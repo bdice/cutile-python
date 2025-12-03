@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import FrozenSet, Optional, Dict
+from typing import FrozenSet, Dict
 
-from cuda.tile._ir.ir import Var, Function, Block
-from cuda.tile._ir.ops import Assign, CarriedVariables, ListItemOperation, IfElseResults, \
+from cuda.tile._ir.ir import Var, Block
+from cuda.tile._ir.ops import Assign, ListItemOperation, \
     Loop, IfElse, Continue, Break, EndBranch, PointerOffset, GetArrayBasePtr, ScalarToTile, \
     TileBroadcast, TileReshape
 
@@ -46,16 +46,16 @@ class AliasResult:
         return self.aliases.get(var_name, ALIAS_UNIVERSE)
 
 
-def alias_analysis_pass(function: Function) -> AliasResult:
+def alias_analysis_pass(root_block: Block) -> AliasResult:
     alias_tracker = _AliasTracker()
-    for p in function.parameters:
+    for p in root_block.params:
         alias_tracker[p.name] = frozenset([p.name])
 
-    _analyze_aliases_in_block(function.root_block, alias_tracker, False)
+    _analyze_aliases_in_block(root_block, alias_tracker, None, None)
 
     while alias_tracker.dirty:
         alias_tracker.dirty = False
-        _analyze_aliases_in_block(function.root_block, alias_tracker, False)
+        _analyze_aliases_in_block(root_block, alias_tracker, None, None)
 
     return AliasResult(alias_tracker.finalize())
 
@@ -93,7 +93,8 @@ def _propagate(alias_tracker: _AliasTracker,
 
 def _analyze_aliases_in_block(block: Block,
                               alias_tracker: _AliasTracker,
-                              for_loop: bool):
+                              innermost_loop: Loop | None,
+                              innermost_ifelse: IfElse | None):
     for op in block.operations:
         if isinstance(op, Assign):
             _propagate(alias_tracker, op.value, op.result_var)
@@ -108,59 +109,46 @@ def _analyze_aliases_in_block(block: Block,
             # Needed for tiles of pointers produced by gather/scatter
             _propagate(alias_tracker, op.x, op.result_var)
         elif isinstance(op, Loop):
-            if op.for_loop is not None:
-                alias_tracker[op.for_loop.induction_var.name] = ALIAS_UNIVERSE
+            if op.iterable is not None:
+                alias_tracker[op.induction_var.name] = ALIAS_UNIVERSE
 
-            for init, body, result in _get_carried_var_triplets(op.carried_vars):
+            for init, body, result in zip(op.initial_values, op.body_vars, op.result_vars,
+                                          strict=True):
                 # Loop initial values flow into body values.
                 _propagate(alias_tracker, init, body)
 
                 # `For` loop initial values can flow into result values if
                 # loop runs for 0 iteration.
-                if op.for_loop is not None:
+                if op.iterable is not None:
                     _propagate(alias_tracker, init, result)
 
-            _analyze_aliases_in_block(op.body, alias_tracker,
-                                      op.for_loop is not None)
+            _analyze_aliases_in_block(op.body, alias_tracker, op, None)
 
         elif isinstance(op, Continue):
-            for next, (_, body, result) in zip(
-                op.next_vars, _get_carried_var_triplets(op.loop_vars), strict=True
-            ):
+            for next, body, result in zip(op.next_vars, innermost_loop.body_vars,
+                                          innermost_loop.result_vars, strict=True):
                 # Loop next values can flow into body values
                 _propagate(alias_tracker, next, body)
 
                 # `For` loop next values can flow into result values when
                 # the iterator is exhausted.
-                if for_loop:
+                if innermost_loop.iterable is not None:
                     _propagate(alias_tracker, next, result)
 
         elif isinstance(op, Break):
-            for output, (_, _, result) in zip(
-                op.output_vars, _get_carried_var_triplets(op.loop_vars), strict=True
-            ):
+            for output, result in zip(op.output_vars, innermost_loop.result_vars, strict=True):
                 _propagate(alias_tracker, output, result)
 
         elif isinstance(op, IfElse):
-            _analyze_aliases_in_block(op.then_block, alias_tracker, for_loop)
+            _analyze_aliases_in_block(op.then_block, alias_tracker, innermost_loop, op)
 
-            _analyze_aliases_in_block(op.else_block, alias_tracker, for_loop)
+            _analyze_aliases_in_block(op.else_block, alias_tracker, innermost_loop, op)
 
         elif isinstance(op, EndBranch):
-            for output, result in zip(
-                op.outputs, _get_ifelse_result_vars(op.ifelse_results), strict=True
-            ):
+            for output, result in zip(op.outputs, innermost_ifelse.result_vars, strict=True):
                 _propagate(alias_tracker, output, result)
 
         else:
             assert len(op.nested_blocks) == 0
             for v in op.result_vars:
                 alias_tracker[v.name] = ALIAS_UNIVERSE
-
-
-def _get_carried_var_triplets(carried_vars: Optional[CarriedVariables]):
-    return carried_vars.zipped_triplets() if carried_vars else ()
-
-
-def _get_ifelse_result_vars(ifelse_results: Optional[IfElseResults]):
-    return ifelse_results.vars if ifelse_results else ()

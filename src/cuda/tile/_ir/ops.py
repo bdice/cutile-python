@@ -7,7 +7,7 @@ import operator
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Optional, Union, Any, List, Iterator, Callable
+from typing import Sequence, Tuple, Optional, Union, Any, List, Callable
 
 from typing_extensions import override
 
@@ -20,14 +20,16 @@ from cuda.tile._exception import (
     ConstFoldNotImplementedError,
 )
 from cuda.tile._ir.ir import (
-    AstOperation, Operation, Var, Loc, Block, TypeResult,
-    has_side_effects, terminator, Mapper, add_operation, TypedOperation, RangeInfo, Builder
+    Operation, Var, Loc, Block,
+    has_side_effects, terminator, add_operation, TypedOperation, RangeInfo, Builder,
+    has_multiple_results, nested_block, PhiState, LoopInfo, get_innermost_loop, LoopVarState
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
     tile_load_generate_bytecode, tile_store_generate_bytecode,
     load_pointer_lowering, store_pointer_lowering,
 )
+from . import hir
 from .op_impl import (
     impl, require_constant_int, require_constant_int_tuple,
     require_tile_type, normalize_axis, require_dtype_spec,
@@ -37,7 +39,7 @@ from .op_impl import (
     require_index_or_index_tuple_type, require_constant_shape, require_constant_axis_order,
     require_constant_enum, require_optional_constant_int, require_optional_constant_bool,
     require_optional_constant_str, PrintfValidator, require_tile_or_scalar_maybe_loose_type,
-    require_scalar_or_0d_tile_maybe_loose_type)
+    require_scalar_or_0d_tile_maybe_loose_type, require_bool, require_optional_range_type)
 from .ops_utils import (
     BINOP_REGISTRY, UNARYOP_REGISTRY,
     check_rd_and_ftz, PaddingMode,
@@ -49,7 +51,7 @@ from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval
 from .type import (
     TupleTy, TileTy, NoneType, BoundMethodTy, SizeTy, ArrayTy,
     ListTy, make_tile_ty, SliceType, DTypeConstructor, PointerTy, RangeIterType, Type,
-    UNDEFINED, NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy
+    NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy
 )
 from cuda.tile._datatype import (
     DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float,
@@ -61,66 +63,8 @@ from cuda.tile._ir2bytecode import (
     generate_bytecode_for_block, convert_dtype, flatten_type, get_list_item_repr_size_in_words,
     get_list_partition_view_tile_size
 )
-from cuda.tile._passes.typeinfer import (
-    TypingContext, infer_types_in_block, propagate_type
-)
 import cuda.tile._bytecode as bc
-
-
-# ================================================
-# Ast Parsing operations
-# ================================================
-class Store(AstOperation):
-    def __init__(self, lhs_var_name: str, rhs: Var, loc: Loc):
-        super().__init__("store",
-                         operands={"rhs": rhs},
-                         attributes={"lhs_var_name": lhs_var_name},
-                         result_vars=[], loc=loc)
-
-
-def store(lhs_var_name: str, rhs: Var, block: Block, loc: Loc) -> None:
-    store_op = Store(lhs_var_name, rhs, loc)
-    block.append(store_op)
-
-
-class Load(AstOperation):
-    def __init__(self, var_name: str, result_var: Var, loc: Loc):
-        super().__init__("load", operands={},
-                         attributes={"var_name": var_name},
-                         result_vars=[result_var], loc=loc)
-
-
-def load(var_name: str, block: Block, loc: Loc, res: Var) -> None:
-    load_op = Load(var_name, res, loc)
-    block.append(load_op)
-
-
-class Call(Operation):
-    def __init__(
-        self,
-        func: Var,
-        args: Tuple[Var, ...],
-        kwargs: Tuple[Tuple[str, Var], ...],
-        result_var: Var,
-        loc: Loc,
-    ):
-        kwarg_vars = tuple(v for _, v in kwargs)
-        kwarg_names = tuple(k for k, _ in kwargs)
-        super().__init__("call",
-                         operands={"func": func, "args": args, "kwargs": kwarg_vars},
-                         attributes={"kwarg_names": kwarg_names},
-                         result_vars=[result_var], loc=loc)
-
-    def kwarg_dict(self):
-        return dict(zip(self.kwarg_names, self.kwargs))
-
-
-def call(
-    func: Var, args: Tuple[Var, ...], kwargs: Tuple[Tuple[str, Var], ...],
-    block: Block, loc: Loc, res: Var
-) -> None:
-    call_op = Call(func, args, kwargs, res, loc)
-    block.append(call_op)
+from .._passes.ast2hir import _store_var, _load_var
 
 
 # ================================================
@@ -128,138 +72,72 @@ def call(
 # ================================================
 
 
-# This is not a dataclass because we want object identity hashing
-class CarriedVariables:
-    names: Sequence[str]
-    initial: Sequence[Var]
-    body: Sequence[Var]
-    results: Sequence[Var] = ()
-
-    def __init__(self,
-                 names: Sequence[str],
-                 initial: Sequence[Var],
-                 body: Sequence[Var],
-                 results: Sequence[Var] = ()):
-        self.names = names
-        self.initial = initial
-        self.body = body
-        self.results = results
-
-    def zipped_triplets(self) -> Iterator[Tuple[Var, Var, Var]]:
-        return zip(self.initial, self.body, self.results)
-
-
-@dataclass
-class ForLoopInfo:
-    induction_var: Var
-    iterable: Var
-
-
-class Loop(Operation):
+@has_multiple_results
+class Loop(TypedOperation):
     def __init__(
         self,
+        iterable: Optional[Var],
+        initial_values: tuple[Var, ...],
+        result_vars: tuple[Var, ...],
         body: Block,
-        loc: Loc,
-        for_loop: Optional[ForLoopInfo] = None,
-        carried_vars: Optional[CarriedVariables] = None,
+        loc: Loc
     ):
         super().__init__(
             "loop",
-            operands={},
-            result_vars=carried_vars.results if carried_vars else [],
+            operands={"iterable": iterable, "initial_values": initial_values},
+            result_vars=list(result_vars),
             nested_blocks=[body],
             loc=loc,
         )
-        self.for_loop: Optional[ForLoopInfo] = for_loop
-        self.carried_vars = carried_vars
 
     @property
     def body(self):
         return self.nested_blocks[0]
 
-    def clone(self, mapper: Mapper) -> Operation:
-        if self.carried_vars is not None:
-            new_carried_vars = CarriedVariables(
-                names=self.carried_vars.names,
-                initial=tuple(mapper.get_var(v) for v in self.carried_vars.initial),
-                body=mapper.clone_vars(self.carried_vars.body),
-                results=mapper.clone_vars(self.carried_vars.results),
-            )
-            mapper.set_object(self.carried_vars, new_carried_vars)
-        else:
-            new_carried_vars = None
+    @property
+    def induction_var(self):
+        assert self.iterable is not None
+        return self.nested_blocks[0].params[0]
 
-        if self.for_loop is not None:
-            new_induction_var = mapper.clone_var(self.for_loop.induction_var)
-            iterable = mapper.get_var(self.for_loop.iterable)
-            new_for_loop = ForLoopInfo(new_induction_var, iterable)
-        else:
-            new_for_loop = None
-
-        res = self._clone_impl(mapper, [] if new_carried_vars is None else new_carried_vars.results)
-        res.for_loop = new_for_loop
-        res.carried_vars = new_carried_vars
-        return res
-
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        if self.for_loop is not None:
-            # Assign type to induction_var
-            iterable_type = typing_context.get_type(self.for_loop.iterable)
-            if not isinstance(iterable_type, RangeIterType):
-                raise TypeError(f"Expected a range iterable for {self.for_loop.iterable.name},"
-                                f"got {iterable_type}")
-            typing_context.set_type(self.for_loop.induction_var, iterable_type.dtype)
-
-            for initial_var, res_var in zip(self.carried_vars.initial, self.carried_vars.results):
-                typing_context.phi_propagate_constant(initial_var, res_var)
-
-        for initial_var, body_var in zip(self.carried_vars.initial, self.carried_vars.body):
-            typing_context.set_type(body_var, typing_context.get_type(initial_var))
-
-        # TODO: propagate constants from initial to body variables
-
-        for nested_block in self.nested_blocks:
-            infer_types_in_block(typing_context, nested_block)
-
-        for var in self.carried_vars.results:
-            typing_context.phi_finalize_constant(var)
-        return [typing_context.get_type(body_var) for body_var in self.carried_vars.body]
+    @property
+    def body_vars(self) -> tuple[Var, ...]:
+        return self.body.params if self.iterable is None else self.body.params[1:]
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value, ...], ...]:
-        result_types = tuple(ctx.typeof(x) for x in self.carried_vars.results)
+        types = tuple(x.get_type() for x in self.body_vars)
         initial_values = [
             val
-            for input_var, ty in zip(self.carried_vars.initial, result_types)
+            for input_var, ty in zip(self.initial_values, types)
             for val in ctx.get_value_tuple_allow_undefined(input_var, ty)
         ]
         result_type_ids = [type_id
-                           for ty in result_types
+                           for ty in types
                            for type_id in typeid_tuple(ctx.type_table, ty)]
 
         assert len(result_type_ids) == len(initial_values)
 
-        if self.for_loop is None:
+        if self.iterable is None:
             nested_builder = bc.encode_LoopOp(ctx.builder, result_type_ids, initial_values)
             block_arg_type_ids = result_type_ids
         else:
-            start, stop, step = ctx.get_value_tuple(self.for_loop.iterable)
+            start, stop, step = ctx.get_value_tuple(self.iterable)
             nested_builder = bc.encode_ForOp(ctx.builder, result_type_ids, start, stop, step,
                                              initial_values)
-            induction_var_type_id = ctx.typeid_of(self.for_loop.induction_var)
+            induction_var_type_id = ctx.typeid_of(self.induction_var)
             block_arg_type_ids = (induction_var_type_id, *result_type_ids)
 
-        with nested_builder.new_block(block_arg_type_ids) as block_args:
+        with nested_builder.new_block(block_arg_type_ids) as block_args, ctx.enter_loop(self):
             block_args = iter(block_args)
-            if self.for_loop is not None:
-                ctx.set_values(self.for_loop.induction_var, (next(block_args),),)
-            for var, value_tuple in zip(self.carried_vars.body,
-                                        unflatten_values(block_args, result_types), strict=True):
+            if self.iterable is not None:
+                ctx.set_values(self.induction_var, (next(block_args),),)
+            for var, value_tuple in zip(self.body_vars,
+                                        unflatten_values(block_args, types), strict=True):
                 ctx.set_values(var, value_tuple)
             generate_bytecode_for_block(ctx, self.body)
 
         result_values = nested_builder.done()
-        return unflatten_values(iter(result_values), result_types)
+        return unflatten_values(iter(result_values), types)
 
     @override
     def _to_string_block_prefixes(self) -> List[str]:
@@ -273,44 +151,91 @@ class Loop(Operation):
                 return var.name
             return f"{var.name}: {ty}"
 
-        if self.for_loop is not None:
-            header_str = f"for {self.for_loop.induction_var.name} in {self.for_loop.iterable.name}"
+        if self.iterable is not None:
+            body_vars = self.body.params[1:]
+            header_str = f"for {self.body.params[0].name} in {self.iterable.name}"
         else:
+            body_vars = self.body.params
             header_str = "loop"
 
-        if self.carried_vars is not None:
-            carried_vars_str = ", ".join(
-                f"{format_var(b)} = {i.name}"
-                for b, i in zip(self.carried_vars.body, self.carried_vars.initial)
-                )
-        else:
-            carried_vars_str = "()"
+        carried_vars_str = ", ".join(f"{format_var(b)} = {i.name}"
+                                     for b, i in zip(body_vars, self.initial_values))
         return f"{header_str} (with {carried_vars_str})"
 
 
-@dataclass(eq=False)
-class IfElseResults:
-    names: Sequence[str]
-    vars: Sequence[Var] = ()
+@impl(hir.loop)
+def loop_impl(body: hir.Block, iterable: Var, initial_values: tuple[Var, ...]):
+    from .._passes.hir2ir import dispatch_hir_block
+
+    range_ty = require_optional_range_type(iterable)
+    if range_ty is None and body.jump == hir.Jump.BREAK and not _have_nested_jump(body.calls):
+        # In ast2hir, we create a loop around the body in order to support early returns.
+        # But if there is no early return, we can remove the loop. In this case the loop
+        # will only have a "break" at the end of the body, and no other break/continue statements.
+        for initial_var, body_var in zip(initial_values, body.params, strict=True):
+            assign(initial_var, body_var)
+        return dispatch_hir_block(body, ignore_jump=True)
+
+    var_states = tuple(LoopVarState(PhiState(), PhiState()) for _ in initial_values)
+
+    if range_ty is not None:
+        body_vars = body.params[1:]
+        for initial_var, state in zip(initial_values, var_states, strict=True):
+            state.result_phi.propagate(initial_var)
+        # Assign type to induction variable
+        body.params[0].set_type(range_ty.dtype)
+    else:
+        body_vars = body.params
+
+    for initial_var, body_var, state in zip(initial_values, body_vars, var_states, strict=True):
+        state.body_phi.set_nonconstant()
+        state.body_phi.propagate(initial_var, allow_loose_typing=False)
+        body_var.set_type(state.body_phi.ty)
+
+    loop_info = LoopInfo(var_states, range_ty is not None)
+    with nested_block(body.name, body.loc, body.params, loop_info) as new_body:
+        dispatch_hir_block(body)
+
+    for body_var, state in zip(body_vars, var_states, strict=True):
+        state.finalize_loopvar_type(body_var)
+
+    result_vars = add_operation(Loop, (None,) * len(var_states),
+                                iterable=None if range_ty is None else iterable,
+                                initial_values=initial_values,
+                                body=new_body)
+
+    for res, state in zip(result_vars, var_states, strict=True):
+        state.result_phi.finalize(res)
+
+    return result_vars
 
 
-class IfElse(Operation):
+def _have_nested_jump(calls: Sequence[hir.Call]) -> bool:
+    return any(
+        block.jump != hir.Jump.END_BRANCH or _have_nested_jump(block.calls)
+        for c in calls
+        if c.callee is hir.if_else
+        for block in c.args[1:]
+    )
+
+
+@has_multiple_results
+class IfElse(TypedOperation):
     def __init__(
         self,
         cond: Var,
         then_block: Block,
         else_block: Block,
+        result_vars: Sequence[Var],
         loc: Loc,
-        results: Optional[IfElseResults] = None,
     ):
         super().__init__(
             "ifelse",
             operands={"cond": cond},
-            result_vars=results.vars if results else [],
+            result_vars=list(result_vars),
             nested_blocks=[then_block, else_block],
             loc=loc,
         )
-        self.results = results
 
     @property
     def then_block(self):
@@ -320,40 +245,10 @@ class IfElse(Operation):
     def else_block(self):
         return self.nested_blocks[1]
 
-    def clone(self, mapper: Mapper):
-        if self.results is None:
-            new_result_vars = []
-            new_results = None
-        else:
-            new_result_vars = mapper.clone_vars(self.results.vars)
-            new_results = IfElseResults(self.results.names, new_result_vars)
-            mapper.set_object(self.results, new_results)
-        res = self._clone_impl(mapper, new_result_vars)
-        res.results = new_results
-        return res
-
-    @override
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        cond_type = typing_context.get_type(self.cond)
-        if not datatype.is_boolean(cond_type):
-            raise TileTypeError('condition must be a bool')
-
-        for nested_block in self.nested_blocks:
-            infer_types_in_block(typing_context, nested_block)
-
-        for var in self.results.vars:
-            typing_context.phi_finalize_constant(var)
-
-        # end_branch should have inferred the types of the results.
-        # Note the result types will be actually assigned twice:
-        # once in the end_branch operation and once after this method.
-        # TODO: We should do type assignment here.
-        return [typing_context.get_type(var) for var in self.results.vars]
-
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value, ...]]:
         cond_val = ctx.get_value(self.cond)
-        result_types = tuple(ctx.typeof(v) for v in self.results.vars)
+        result_types = tuple(ctx.typeof(v) for v in self.result_vars)
         result_type_id_tuples = tuple(typeid_tuple(ctx.type_table, t) for t in result_types)
         result_type_ids = sum(result_type_id_tuples, ())
         nested_builder = bc.encode_IfOp(ctx.builder, result_type_ids, cond_val)
@@ -374,61 +269,59 @@ class IfElse(Operation):
         return f"if(cond={self.cond})"
 
 
+@impl(hir.if_else)
+def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tuple[Var, ...] | None:
+    from .._passes.hir2ir import dispatch_hir_block
+
+    require_bool(cond)
+    if cond.is_constant():
+        branch_taken = then_block if cond.get_constant() else else_block
+        have_end_branch = branch_taken.jump == hir.Jump.END_BRANCH
+        return dispatch_hir_block(branch_taken, ignore_jump=have_end_branch)
+
+    # Convert each branch from HIR to IR
+    with nested_block(then_block.name, then_block.loc) as new_then_block:
+        then_results = dispatch_hir_block(then_block)
+    with nested_block(else_block.name, else_block.loc) as new_else_block:
+        else_results = dispatch_hir_block(else_block)
+
+    # Figure out the number of results
+    branch_results = []
+    if then_block.jump == hir.Jump.END_BRANCH:
+        branch_results.append(then_results)
+    if else_block.jump == hir.Jump.END_BRANCH:
+        branch_results.append(else_results)
+
+    # Generate an IfElse op. Don't set result types yet -- phi.finalize() will do the work.
+    num_results = 0 if len(branch_results) == 0 else len(branch_results[0])
+    result_vars = add_operation(IfElse, (None,) * num_results,
+                                cond=cond, then_block=new_then_block, else_block=new_else_block)
+
+    # Infer the result types & constants
+    phi_states = tuple(PhiState() for _ in range(num_results))
+    for br in branch_results:
+        for res, phi in zip(br, phi_states, strict=True):
+            phi.propagate(res)
+    for var, phi, in zip(result_vars, phi_states, strict=True):
+        phi.finalize(var)
+    return result_vars
+
+
 # Maps to ContinueOp in TileIR
 @terminator
-class Continue(Operation):
+class Continue(TypedOperation):
     def __init__(
         self,
         loc: Loc,
         next_vars: Tuple[Var, ...] = (),
-        loop_vars: Optional[CarriedVariables] = None,
-        is_for_loop_body: bool = False
     ):
         super().__init__("continue", operands={"next_vars": next_vars}, result_vars=[], loc=loc)
-        self.loop_vars = loop_vars
-        self.is_for_loop_body = is_for_loop_body
-
-    def clone(self, mapper: Mapper) -> Operation:
-        res = self._clone_impl(mapper, [])
-        if self.loop_vars is not None:
-            res.loop_vars = mapper.get_object(self.loop_vars)
-        return res
-
-    @override
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        if self.loop_vars is not None:
-            for var, initial_var, body_var, result_var in zip(
-                self.next_vars, self.loop_vars.initial, self.loop_vars.body, self.loop_vars.results
-            ):
-                var_type = typing_context.get_type(var)
-                if typing_context.typemap.get(initial_var.name, UNDEFINED) is not UNDEFINED:
-                    initial_var_type = typing_context.typemap[initial_var.name]
-                    if initial_var_type != var_type:
-                        original_name = typing_context.ir_ctx.get_original_name(initial_var.name)
-                        raise TileTypeError(
-                            f"Type mismatch for loop variable `{original_name}` with "
-                            f"initialized type {initial_var_type} and computed type {var_type}. "
-                            f"Please change the initial value to match the computed type.",
-                            loc=var.loc
-                        )
-                for dest_var in (body_var, result_var):
-                    if typing_context.typemap.get(
-                        dest_var.name, UNDEFINED
-                    ) is UNDEFINED:
-                        typing_context.set_type(dest_var, var_type)
-
-                # TODO: propagate constant values back to the body vars
-
-                if self.is_for_loop_body:
-                    typing_context.phi_propagate_constant(var, result_var)
-
-        return []
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
         next_values = [value
-                       for var, res_var in zip(self.next_vars, self.loop_vars.results)
-                       for value in ctx.get_value_tuple_allow_undefined(var, ctx.typeof(res_var))]
+                       for var, body_var in zip(self.next_vars, ctx.innermost_loop.body_vars)
+                       for value in ctx.get_value_tuple_allow_undefined(var, ctx.typeof(body_var))]
         bc.encode_ContinueOp(ctx.builder, next_values)
         return ()
 
@@ -437,56 +330,36 @@ class Continue(Operation):
         return f"continue {', '.join([x.name for x in self.next_vars])}"
 
 
+def continue_(next_values):
+    loop_info = get_innermost_loop()
+    assert loop_info is not None
+
+    for nextval, state in zip(next_values, loop_info.var_states):
+        state.body_phi.propagate(nextval, fail_eagerly=True)
+        if loop_info.is_for_loop:
+            state.result_phi.propagate(nextval)
+
+    add_operation(Continue, (), next_vars=next_values)
+
+
 # Maps to BreakOp
 @terminator
-class Break(Operation):
+class Break(TypedOperation):
     def __init__(
         self,
         loc: Loc,
         output_vars: Tuple[Var, ...] = (),
-        loop_vars: Optional[CarriedVariables] = None,
     ):
         super().__init__("break", operands={"output_vars": output_vars}, result_vars=[], loc=loc)
-        self.loop_vars = loop_vars
-
-    def clone(self, mapper: Mapper) -> Operation:
-        res = self._clone_impl(mapper, [])
-        if self.loop_vars is not None:
-            res.loop_vars = mapper.get_object(self.loop_vars)
-        return res
-
-    @override
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        if self.loop_vars is not None:
-            for var, initial_var, body_var, result_var in zip(
-                self.output_vars, self.loop_vars.initial,
-                self.loop_vars.body, self.loop_vars.results
-            ):
-                var_type = typing_context.get_type(var)
-                if typing_context.typemap.get(initial_var.name, UNDEFINED) is not UNDEFINED:
-                    initial_var_type = typing_context.typemap[initial_var.name]
-                    if initial_var_type != var_type:
-                        original_name = typing_context.ir_ctx.get_original_name(initial_var.name)
-                        raise TileTypeError(
-                            f"Type mismatch for loop variable `{original_name}` with "
-                            f"initialized type {initial_var_type} and computed type {var_type}. "
-                            f"Please change the initial value to match the computed type.",
-                            loc=var.loc
-                        )
-                for dest_var in (body_var, result_var):
-                    if typing_context.typemap.get(
-                        dest_var.name, UNDEFINED
-                    ) is UNDEFINED:
-                        typing_context.set_type(dest_var, var_type)
-                typing_context.phi_propagate_constant(var, result_var)
-
-        return []
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
+        # body_vars is not a typo. We use body variables because they always contain the actual
+        # types of the loop variables, whereas result variables may have an InvalidType.
         output_values = [value
-                         for var, res_var in zip(self.output_vars, self.loop_vars.results)
-                         for value in ctx.get_value_tuple_allow_undefined(var, ctx.typeof(res_var))]
+                         for var, body_var in zip(self.output_vars, ctx.innermost_loop.body_vars)
+                         for value in ctx.get_value_tuple_allow_undefined(var,
+                                                                          ctx.typeof(body_var))]
         bc.encode_BreakOp(ctx.builder, output_values)
         return ()
 
@@ -495,31 +368,25 @@ class Break(Operation):
         return f"break {', '.join([x.name for x in self.output_vars])}"
 
 
+def break_(result_values):
+    loop_info = get_innermost_loop()
+    assert loop_info is not None
+
+    for nextval, state in zip(result_values, loop_info.var_states, strict=True):
+        state.result_phi.propagate(nextval)
+
+    add_operation(Break, (), output_vars=result_values)
+
+
 # Maps to YieldOp
 @terminator
-class EndBranch(Operation):
+class EndBranch(TypedOperation):
     def __init__(
         self,
         loc: Loc,
         outputs: Tuple[Var, ...] = (),
-        ifelse_results: Optional[IfElseResults] = None,
     ):
         super().__init__("end_branch", operands={"outputs": outputs}, result_vars=[], loc=loc)
-        self.ifelse_results = ifelse_results
-
-    def clone(self, mapper: Mapper) -> Operation:
-        res = self._clone_impl(mapper, [])
-        if self.ifelse_results is not None:
-            res.ifelse_results = mapper.get_object(self.ifelse_results)
-        return res
-
-    @override
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        if self.ifelse_results is not None:
-            for branch_res, ifelse_res in zip(self.outputs, self.ifelse_results.vars):
-                propagate_type(branch_res, ifelse_res)
-                typing_context.phi_propagate_constant(branch_res, ifelse_res)
-        return []
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -534,17 +401,14 @@ class EndBranch(Operation):
         return f"yield {', '.join([x.name for x in self.outputs])}"
 
 
-@terminator
-class Return(Operation):
-    def __init__(self, value: Var, loc: Loc):
-        super().__init__("return", operands={"value": value}, result_vars=[], loc=loc)
+def end_branch(outputs):
+    add_operation(EndBranch, (), outputs=outputs)
 
-    @override
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        value_type = typing_context.get_type(self.value)
-        if value_type is not NONE:
-            raise TileTypeError("Tile kernels cannot return values")
-        return []
+
+@terminator
+class Return(TypedOperation):
+    def __init__(self, loc: Loc):
+        super().__init__("return", operands={}, result_vars=[], loc=loc)
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -553,7 +417,13 @@ class Return(Operation):
 
     @override
     def _to_string_rhs(self) -> str:
-        return f"return {self.value.name}"
+        return "return"
+
+
+def return_(value):
+    if value.get_type() is not NONE:
+        raise TileTypeError("Tile kernels cannot return values")
+    add_operation(Return, ())
 
 
 def _check_value_numeric_type(value: Any, dtype: DType) -> None:
@@ -566,26 +436,6 @@ def _check_value_numeric_type(value: Any, dtype: DType) -> None:
     else:
         if value_type != dtype:
             raise TileTypeError(f"Expect \"value\" to be a {dtype}, got {value_type}")
-
-
-class Const(Operation):
-    def __init__(
-        self,
-        value: Any,
-        result_var: Var,
-        loc: Loc,
-    ):
-        super().__init__(
-            "const",
-            operands={},
-            result_vars=[result_var],
-            attributes={"value": value},
-            loc=loc,
-        )
-
-
-def const(value: Any, block: Block, loc: Loc, res: Var) -> None:
-    block.append(Const(value, res, loc))
 
 
 class TypedConst(TypedOperation):
@@ -1364,7 +1214,7 @@ class BuildTuple(TypedOperation):
         return [sum((ctx.get_value_tuple(x) for x in self.items), ())]
 
 
-@impl(ct._build_tuple)
+@impl(hir.build_tuple)
 def build_tuple(items: tuple[Var, ...]) -> Var:
     ty = TupleTy(tuple(x.get_type() for x in items))
     loose_ty = TupleTy(tuple(x.get_loose_type() for x in items))
@@ -1706,12 +1556,7 @@ def assign(value: Var, res: Var) -> None:
         res.set_undefined()
 
 
-def assign_untyped(value: Var, res: Var):
-    identity_var = add_operation(Const, None, value=ct._identity)
-    Builder.get_current().append_verbatim(Call(identity_var, (value,), (), res, res.loc))
-
-
-@impl(ct._identity)
+@impl(hir.identity)
 def identity_impl(x: Var) -> Var:
     if x.is_constant():
         return loosely_typed_const(x.get_constant(), x.get_type(), x.get_loose_type())
@@ -3451,6 +3296,16 @@ def tile_item(tile: Var) -> Var:
         raise TileTypeError(f"Expected a tile of size 1 to get scalar item, "
                             f"got a tile of size {x_ty.numel}")
     return add_operation(TileItem, x_ty.dtype, x=tile)
+
+
+@impl(_store_var)
+def store_var_impl(name, value):
+    raise AssertionError("_store_var must have been eliminated")
+
+
+@impl(_load_var)
+def load_var_impl(name):
+    raise AssertionError("_load_var must have been eliminated")
 
 
 LoadMemoryOperation = TileLoad | LoadPointer

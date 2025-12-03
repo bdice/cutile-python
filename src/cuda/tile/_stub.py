@@ -1892,9 +1892,3 @@ def assert_(cond, /, message=None) -> None:
 # ==== Private stubs ====
 
 def _m_tile_item(tile): ...  # Tile.item()
-
-
-def _build_tuple(*items): ...
-
-
-def _identity(x): ...   # Identity function (i.e. returns x)

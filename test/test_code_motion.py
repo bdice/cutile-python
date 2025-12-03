@@ -210,12 +210,11 @@ def test_hoisting(kernel, op_finder, expected_x):
 
     x = torch.zeros(3, dtype=torch.float32, device="cuda")
     a = torch.tensor([5, 6, 7], dtype=torch.int32, device="cuda")
-    ir = compile_tile(kernel._pyfunc, (x, a, 4.0), CompilerOptions()).final_ir
-    print(ir.root_block)
+    root_block = compile_tile(kernel._pyfunc, (x, a, 4.0), CompilerOptions()).final_ir
 
-    op = op_finder(ir.root_block)
+    op = op_finder(root_block)
 
-    nested_loops = _find_nested_loops(ir.root_block, op)
+    nested_loops = _find_nested_loops(root_block, op)
     assert len(nested_loops) == len(expected_to_hoist)
 
     for loop, expected in zip(nested_loops, expected_to_hoist, strict=True):

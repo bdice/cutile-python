@@ -8,7 +8,7 @@ from typing import Callable, Any, Dict, Sequence, List, Mapping, Set
 
 from cuda.tile import _datatype as datatype
 from cuda.tile._exception import Loc
-from cuda.tile._ir.ir import Operation, Var, Function, Block, IRContext
+from cuda.tile._ir.ir import Operation, Var, Block, IRContext
 from cuda.tile._ir.ops import RawBinaryArithmeticOperation, FusedMulAddOperation, Unary
 from cuda.tile._ir.ops_utils import get_dtype, get_default_rounding_mode
 from cuda.tile._ir.type import Type
@@ -123,10 +123,10 @@ def fuse_mul_addsub(op: RawBinaryArithmeticOperation, ctx: MatchContext):
     ctx.add_rewrite((mul_op, op), new_ops)
 
 
-def rewrite_patterns(func: Function):
-    ctx = MatchContext(func.root_block.ctx)
+def rewrite_patterns(root_block: Block):
+    ctx = MatchContext(root_block.ctx)
     uses = defaultdict(list)
-    for op in func.root_block.traverse():
+    for op in root_block.traverse():
         for pat in _patterns_by_op_class.get(type(op), ()):
             try:
                 match_res = pat.predicate(op, ctx)
@@ -157,13 +157,13 @@ def rewrite_patterns(func: Function):
         replacements[r.to_remove[-1]] = r.to_add
         rewritten_ops.update(r.to_remove)
 
-    _apply_rewrites(func.root_block, rewritten_ops, replacements)
+    _apply_rewrites(root_block, rewritten_ops, replacements)
 
 
 def _apply_rewrites(block: Block,
                     rewritten_ops: Set[Operation],
                     replacements: Mapping[Operation, Sequence[Operation]]):
-    new_block = Block(block.ctx)
+    new_block = block.empty_like_self()
     for op in block:
         for nb in op.nested_blocks:
             _apply_rewrites(nb, rewritten_ops, replacements)

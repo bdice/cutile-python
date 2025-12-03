@@ -295,6 +295,14 @@ def test_printf_format():
         compile(too_many_args, ())
 
 
+def kernel_if_else(x):
+    if ct.bid(0) == 0:
+        a = 1
+    else:
+        a = 2.0
+    ct.store(x, (0,), a)
+
+
 def kernel_for_loop(x):
     a = 1
     for _ in range(10):
@@ -313,10 +321,10 @@ def kernel_while_loop(x):
     ct.store(x, (0,), a)
 
 
-@pytest.mark.parametrize("kernel", [kernel_for_loop, kernel_while_loop])
-def test_loop_type_mismatch(kernel):
+@pytest.mark.parametrize("kernel", [kernel_if_else, kernel_for_loop, kernel_while_loop])
+def test_control_flow_type_mismatch(kernel):
     x = torch.zeros(1, dtype=torch.float32, device='cuda')
-    msg = re.escape('Type mismatch for loop variable `a`')
+    msg = re.escape('Type of `a` depends on path taken')
     with pytest.raises(TileTypeError, match=msg):
         compile(kernel, (x, ))
 

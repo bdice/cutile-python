@@ -202,12 +202,12 @@ def test_unchecked():
 def test_ir_checked_vs_unchecked(kernel, expected_mask):
     x = torch.arange(10, 18, dtype=torch.float32, device="cuda")
     y = torch.zeros_like(x)
-    ir = compile_tile(kernel._pyfunc, (x, y), CompilerOptions()).final_ir
+    root_block = compile_tile(kernel._pyfunc, (x, y), CompilerOptions()).final_ir
 
-    load_ops = [op for op in ir.root_block.traverse() if isinstance(op, LoadPointerTokenOrdered)]
+    load_ops = [op for op in root_block.traverse() if isinstance(op, LoadPointerTokenOrdered)]
     assert len(load_ops) == 1
     assert (load_ops[0].mask is not None) == expected_mask
 
-    store_ops = [op for op in ir.root_block.traverse() if isinstance(op, StorePointerTokenOrdered)]
+    store_ops = [op for op in root_block.traverse() if isinstance(op, StorePointerTokenOrdered)]
     assert len(store_ops) == 1
     assert (store_ops[0].mask is not None) == expected_mask

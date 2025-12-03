@@ -3,12 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
-from typing import Optional, Set, Dict, DefaultDict, Mapping, NamedTuple, Sequence
+from typing import Optional, Set, Dict, DefaultDict, Mapping, NamedTuple
 
 from cuda.tile._ir.ir import Block, Var, Mapper, IRContext
 from cuda.tile._ir.ops import (Loop, IfElse, RawBinaryArithmeticOperation, RawComparisonOperation,
-                               Assign, UnpackRange, Range, EndBranch, Continue, ForLoopInfo,
-                               CarriedVariables, TypedConst)
+                               Assign, UnpackRange, Range, EndBranch, Continue, TypedConst)
 
 
 class _Condition(NamedTuple):
@@ -48,15 +47,15 @@ def _find_splittable_loops(block: Block,
         elif isinstance(op, Assign):
             equiv_map[op.result_var.name] = equiv_map.get(op.value.name, op.value)
         elif isinstance(op, Loop):
-            good_loop = (op.for_loop is not None
-                         and op.for_loop.iterable.has_range_info()
-                         and op.for_loop.iterable.get_range_info().known_step == 1)
+            good_loop = (op.iterable is not None
+                         and op.iterable.has_range_info()
+                         and op.iterable.get_range_info().known_step == 1)
             _find_splittable_loops(
                 op.body,
                 def_depth,
                 depth + 1,
                 op if good_loop else None,
-                op.for_loop.induction_var.name if good_loop else None,
+                op.body.params[0].name if good_loop else None,
                 dict(),
                 equiv_map,
                 result
@@ -76,7 +75,7 @@ _BRANCH_TO_KEEP = {"ge": ("else_block", "then_block"),
 def _apply_splits(block: Block,
                   loops_to_split: Mapping[Loop, _Condition],
                   if_ops_to_flatten: Set[IfElse]):
-    new_block = Block(block.ctx)
+    new_block = block.empty_like_self()
     for op in block:
         for nested in op.nested_blocks:
             _apply_splits(nested, loops_to_split, if_ops_to_flatten)
@@ -93,7 +92,7 @@ def _apply_splits(block: Block,
 def _split_loop(loop: Loop, cond: _Condition, if_ops_to_flatten: Set[IfElse], new_block: Block):
     typemap = new_block.ctx.typemap
 
-    range_ty = typemap[loop.for_loop.iterable.name]
+    range_ty = typemap[loop.iterable.name]
     range_dtype = range_ty.dtype
     split_value = cond.rhs
     loc = loop.loc
@@ -108,7 +107,7 @@ def _split_loop(loop: Loop, cond: _Condition, if_ops_to_flatten: Set[IfElse], ne
         split_value = plus_one_var
 
     orig_start, orig_stop, orig_step = new_block.make_temp_vars(loc, 3)
-    new_block.append(UnpackRange(loop.for_loop.iterable,
+    new_block.append(UnpackRange(loop.iterable,
                                  (orig_start, orig_stop, orig_step), loc))
 
     first_loop_stop = new_block.make_temp_var(loc)
@@ -134,7 +133,7 @@ def _split_loop(loop: Loop, cond: _Condition, if_ops_to_flatten: Set[IfElse], ne
     for old_var, new_var in zip(loop.result_vars, intermediate_vars, strict=True):
         typemap[new_var.name] = typemap[old_var.name]
 
-    new_block.append(_clone_loop(loop, first_range, loop.carried_vars.initial, intermediate_vars,
+    new_block.append(_clone_loop(loop, first_range, loop.initial_values, intermediate_vars,
                                  if_ops_to_flatten, first_branch, new_block.ctx))
 
     second_loop = _clone_loop(loop, second_range, intermediate_vars, loop.result_vars,
@@ -142,19 +141,14 @@ def _split_loop(loop: Loop, cond: _Condition, if_ops_to_flatten: Set[IfElse], ne
     new_block.append(second_loop)
 
 
-def _clone_loop(loop: Loop, new_range: Var, initial_vars: Sequence[Var], result_vars: Sequence[Var],
+def _clone_loop(loop: Loop, new_range: Var, initial_vars: tuple[Var, ...],
+                result_vars: tuple[Var, ...],
                 if_ops_to_flatten: Set[IfElse], branch_to_keep: str, ctx: IRContext) -> Loop:
     mapper = Mapper(ctx)
-    new_body_vars = mapper.clone_vars(loop.carried_vars.body)
-    new_induction_var = mapper.clone_var(loop.for_loop.induction_var)
-    new_for_loop = ForLoopInfo(new_induction_var, new_range)
-    new_carried_vars = CarriedVariables(names=loop.carried_vars.names,
-                                        initial=initial_vars,
-                                        body=new_body_vars,
-                                        results=result_vars)
-    mapper.set_object(loop.carried_vars, new_carried_vars)
+    new_params = mapper.clone_vars(loop.body.params)
 
-    new_body = Block(ctx)
+    new_name = ctx.make_var(f"^{loop.body.name}", loop.body.loc).name
+    new_body = Block(ctx, new_params, new_name, loop.body.loc)
     for body_op in loop.body:
         if isinstance(body_op, IfElse) and body_op in if_ops_to_flatten:
             early_continue = False
@@ -176,7 +170,7 @@ def _clone_loop(loop: Loop, new_range: Var, initial_vars: Sequence[Var], result_
         else:
             new_body.append(body_op.clone(mapper))
 
-    return Loop(new_body, loop.loc, new_for_loop, new_carried_vars)
+    return Loop(new_range, initial_vars, result_vars, new_body, loop.loc)
 
 
 def split_loops(block: Block):

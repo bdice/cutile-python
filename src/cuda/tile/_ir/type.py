@@ -11,6 +11,9 @@ from functools import reduce
 import operator
 
 from typing import TYPE_CHECKING
+
+from cuda.tile._exception import Loc
+
 if TYPE_CHECKING:
     from cuda.tile._datatype import DType
 
@@ -104,27 +107,17 @@ class EllipsisType(Type):
 ELLIPSIS = EllipsisType()
 
 
-# ============== Undefined Type ===============
+# ============== Invalid Type ===============
 
-class UndefinedType(Type):
-    _instance = None
+# Type that generates an error when used.
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+@dataclass
+class InvalidType(Type):
+    error_message: str
+    loc: Loc
 
-    def __str__(self):
-        return "UndefinedType"
-
-    def __eq__(self, other: Type):
-        return isinstance(other, UndefinedType)
-
-    def __hash__(self):
-        return hash("UndefinedType")
-
-
-UNDEFINED = UndefinedType()
+    def __repr__(self):
+        return f"<Invalid type: {self.error_message}>"
 
 
 # ============== String Type ===============

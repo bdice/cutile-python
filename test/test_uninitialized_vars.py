@@ -7,6 +7,7 @@ import torch
 
 from math import ceil
 import cuda.tile as ct
+from cuda.tile import TileTypeError
 from cuda.tile._exception import TileSyntaxError
 
 
@@ -107,5 +108,5 @@ def test_uninitialized_vars(func):
     C = torch.zeros((m, n), dtype=torch.float32, device=A.device)
     tm, tn, tk = 2, 2, 2
     grid = (ceil(m / tm), ceil(n / tn), 1)
-    with pytest.raises(TileSyntaxError, match="Uninitialized variable"):
+    with pytest.raises((TileSyntaxError, TileTypeError), match="[Uu]ndefined variable"):
         ct.launch(torch.cuda.current_stream(), grid, func, (A, B, C, tm, tn, tk))

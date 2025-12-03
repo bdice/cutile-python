@@ -898,6 +898,7 @@ class TestRuntimeAlias(MLIRTestBase):
         alias = X
         ct.store(alias, index=(0,), tile=ct.full((TILE,), 1, dtype=X.dtype))
         ct.store(Y, index=(0,), tile=ct.full((TILE,), 2, dtype=X.dtype))
+        ta = ct.zeros((TILE,), dtype=X.dtype)
         for i in range(n):
             alias2 = alias
             ta = ct.load(alias2, index=(i,), shape=(TILE,))
@@ -922,6 +923,7 @@ class TestRuntimeAlias(MLIRTestBase):
     def control_flow_tuple_alias(X, Y, _Z, n: int, TILE: ct.Constant[int]):
         ct.store(X, index=(0,), tile=ct.full((TILE,), 1, dtype=X.dtype))
         ct.store(Y, index=(0,), tile=ct.full((TILE,), 2, dtype=X.dtype))
+        alias = Y
         for i in range(n):
             if i:
                 alias = (Y, X)[0]

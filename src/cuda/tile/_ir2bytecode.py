@@ -15,7 +15,7 @@ import cuda.tile._bytecode as bc
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._debug import CUDA_TILE_TESTING_DISABLE_DIV
 from cuda.tile._exception import TileInternalError, TileError, ConstFoldNotImplementedError
-from cuda.tile._ir.ir import Block, Function, Loc, Var, IRContext
+from cuda.tile._ir.ir import Block, Loc, Var, IRContext
 from cuda.tile._ir.ops_utils import (
     padding_mode_to_bytecode, rounding_mode_to_bytecode,
     get_default_rounding_mode, get_dtype,
@@ -527,12 +527,22 @@ class BytecodeContext:
         self._list_partition_views: Dict[str, bc.Value] = {}
         self._assumed_value_ids: Set[int] = set()
         self.sm_arch = sm_arch
+        self.innermost_loop = None
 
     @contextmanager
     def loc(self, loc: Loc):
         debug_attr_id = self._debug_attr_map.get_debugattr(loc)
         with loc, self.builder.debug_attr(debug_attr_id):
             yield
+
+    @contextmanager
+    def enter_loop(self, loop):
+        old = self.innermost_loop
+        self.innermost_loop = loop
+        try:
+            yield
+        finally:
+            self.innermost_loop = old
 
     def typeof(self, var: Var) -> Type:
         return self._typemap[var.name]
@@ -810,7 +820,7 @@ def generate_bytecode_for_block(ctx: BytecodeContext, block: Block):
                 raise TileInternalError(f"Internal error: {e}") from e
 
 
-def generate_bytecode_for_kernel(func_ir: Function,
+def generate_bytecode_for_kernel(root_block: Block,
                                  compiler_options: CompilerOptions,
                                  sm_arch: str,
                                  writer: bc.BytecodeWriter,
@@ -821,16 +831,16 @@ def generate_bytecode_for_kernel(func_ir: Function,
 
     param_type_ids = []
     param_offsets = []
-    for param in func_ir.parameters:
+    for param in root_block.params:
         param_offsets.append(len(param_type_ids))
         ty = param.get_type()
         param_type_ids.extend(typeid_tuple(writer.type_table, ty))
     param_offsets.append(len(param_type_ids))
 
-    debug_attr_map = DebugAttrMap(writer.debug_attr_table, func_ir.qualname, anonymize_debug_attr)
-    func_debug_attr = debug_attr_map.get_debugattr(func_ir.loc)
+    debug_attr_map = DebugAttrMap(writer.debug_attr_table, root_block.name, anonymize_debug_attr)
+    func_debug_attr = debug_attr_map.get_debugattr(root_block.loc)
 
-    with writer.function(name=func_ir.qualname,
+    with writer.function(name=root_block.name,
                          parameter_types=param_type_ids,
                          result_types=(),
                          entry_point=True,
@@ -840,12 +850,12 @@ def generate_bytecode_for_kernel(func_ir: Function,
                               type_table=writer.type_table,
                               debug_attr_map=debug_attr_map,
                               global_section=writer.global_section,
-                              ir_ctx=func_ir.root_block.ctx,
+                              ir_ctx=root_block.ctx,
                               sm_arch=sm_arch)
 
-        for var, start, end in zip(func_ir.parameters, param_offsets[:-1], param_offsets[1:],
+        for var, start, end in zip(root_block.params, param_offsets[:-1], param_offsets[1:],
                                    strict=True):
             values = list(param_values[start:end])
             ctx.set_values(var, values)
 
-        generate_bytecode_for_block(ctx, func_ir.root_block)
+        generate_bytecode_for_block(ctx, root_block)

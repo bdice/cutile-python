@@ -6,7 +6,7 @@ from .._ir import ir
 from .._ir.ops import Assign
 
 
-def eliminate_assign_ops(func: ir.Function):
+def eliminate_assign_ops(root_block: ir.Block):
     def walk(block):
         new_ops = []
         for op in block:
@@ -20,7 +20,7 @@ def eliminate_assign_ops(func: ir.Function):
                 new_ops.append(op)
         block[:] = new_ops
 
-    mapper = ir.Mapper(func.root_block.ctx, preserve_vars=True)
+    mapper = ir.Mapper(root_block.ctx, preserve_vars=True)
     orig_var = dict()
-    walk(func.root_block)
-    func.root_block[:] = [op.clone(mapper) for op in func.root_block]
+    walk(root_block)
+    root_block[:] = [op.clone(mapper) for op in root_block]
