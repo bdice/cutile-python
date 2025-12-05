@@ -2954,8 +2954,11 @@ def cat(tiles: Var, axis: int) -> Var:
     tuple_ty = require_tuple_type(tiles)
     if len(tuple_ty) == 0:
         raise TileTypeError("cat() received an empty tuple")
+    elif len(tuple_ty) > 2:
+        raise TileTypeError(f"cat() supports at most 2 tiles, got {len(tuple_ty)}")
     if not isinstance(first_tile := tuple_ty.value_types[0], TileTy):
         raise TileTypeError(f"Expected tuple of Tile, got a {first_tile}")
+
     dtype = first_tile.dtype
     rank = first_tile.ndim
     shape_value = list(first_tile.shape_value)
@@ -2969,8 +2972,9 @@ def cat(tiles: Var, axis: int) -> Var:
             raise TileTypeError(f"Expected tiles to have the same dtype: {dtype} != {tile_ty.dtype}")  # noqa: E501
         for i, (x, y) in enumerate(zip(shape_value, tile_ty.shape_value, strict=True)):
             if i != axis and x != y:
-                raise TileTypeError("Expected tiles to have the same shape for non axis dimensions, "
-                                    f"got tiles with shapes: {', '.join(str(ty._unwrapped_shape) for ty in tuple_ty.value_types)}")
+                raise TileTypeError("Expected tiles to have the same shape "
+                                    "for non axis dimensions, "
+                                    f"got {tuple(shape_value)} and {tile_ty.shape_value}")
         shape_value[axis] += tile_ty.shape_value[axis]
 
     if not all(_is_power_of_2(x) for x in shape_value):

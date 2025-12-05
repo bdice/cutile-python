@@ -36,7 +36,8 @@ def test_illegal_axis(axis):
 @ct.kernel
 def cat3(out):
     tx = ct.ones((2, 2), ct.int32)
-    ty = ct.cat((tx, tx, tx), 0)
+    ty = ct.ones((4, 2), ct.int32)
+    ty = ct.cat((tx, ty), 0)
     ct.store(out, (0,), tile=ty)
 
 
@@ -44,6 +45,19 @@ def test_non_power_of_two():
     out = torch.zeros(8, dtype=torch.int32, device='cuda')
     with pytest.raises(TileTypeError, match=r"Result tile shape must be power of 2"):
         ct.launch(torch.cuda.current_stream(), (1,), cat3, (out,))
+
+
+@ct.kernel
+def cat4(out):
+    tx = ct.ones((2,), ct.int32)
+    ty = ct.cat((tx, tx, tx, tx), 0)
+    ct.store(out, (0,), tile=ty)
+
+
+def test_more_than_two_tiles():
+    out = torch.zeros(8, dtype=torch.int32, device='cuda')
+    with pytest.raises(TileTypeError, match=r"cat\(\) supports at most 2 tiles, got 4"):
+        ct.launch(torch.cuda.current_stream(), (1,), cat4, (out,))
 
 
 @ct.kernel
