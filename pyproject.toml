@@ -17,22 +17,31 @@ readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
     { name = "NVIDIA Corporation" }
 ]
-license = { text = "Proprietary" }
-requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSES/*"]
+requires-python = ">=3.10, <3.14"
+
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Compilers",
+]
 
 dependencies = [
   "typing-extensions",
 ]
 
-[project.optional-dependencies]
-test = [
-    "pytest",
-    "pytest-benchmark",
-]
-
 [project.urls]
 Homepage = "https://github.com/nvidia/cutile-python"
 Repository = "https://github.com/nvidia/cutile-python"
+documentation = "https://docs.nvidia.com/cuda/cutile-python"
+"Bug Tracker" = "https://github.com/nvidia/cutile-python/issues"
 
 [tool.setuptools.dynamic]
 version = {file = "src/cuda/tile/VERSION"}
