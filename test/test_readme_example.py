@@ -33,4 +33,4 @@ def test_readme():
         # so the file can be read without permission denied.
         atexit.register(os.unlink, f.name)
         f.write(example)
-        subprocess.check_call([sys.executable, f.name])
+    subprocess.check_call([sys.executable, f.name])
