@@ -7,19 +7,17 @@ import inspect
 import operator
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import List, Sequence, Set, Optional, Mapping, Any, Dict, Type, Callable
+from typing import List, Sequence, Optional, Any, Dict, Type, Callable
 
 from cuda.tile import _datatype as datatype
 from cuda.tile._exception import TileSyntaxError, Loc
 from cuda.tile._ir.ir import IRContext, Var
-from cuda.tile._ir.typing_support import get_constant_value
-
 from cuda.tile._ir import hir
 
 
 def get_function_hir(pyfunc: Callable,
                      ir_ctx: IRContext,
-                     call_site: Optional[Loc]) -> hir.Block:
+                     call_site: Optional[Loc]) -> hir.Function:
     # Get the original function from the decorated function if it exists.
     pyfunc = getattr(pyfunc, "__wrapped__", pyfunc)
 
@@ -57,9 +55,15 @@ def get_function_hir(pyfunc: Callable,
     if pyfunc.__closure__:
         for name, cell in zip(pyfunc.__code__.co_freevars, pyfunc.__closure__):
             func_globals[name] = cell.cell_contents
-    ctx = _Context(inspect.getfile(pyfunc), first_line, func_globals, call_site, pyfunc, ir_ctx)
+
+    ctx = _Context(inspect.getfile(pyfunc), first_line, call_site, pyfunc, ir_ctx)
     assert isinstance(func_def, ast.FunctionDef)
-    return _ast2hir(func_def, ctx)
+    body = _ast2hir(func_def, ctx)
+    all_ast_args = _get_all_parameters(func_def, ctx)
+    param_names = tuple(p.arg for p in all_ast_args)
+    param_locs = tuple(ctx.get_loc(p) for p in all_ast_args)
+    body.stored_names.update(param_names)
+    return hir.Function(body, param_names, param_locs, func_globals)
 
 
 # Translate the 1-based line number of the chunk we passed to the AST parser
@@ -77,11 +81,10 @@ class LoopKind(Enum):
 
 
 class _Context:
-    def __init__(self, filename: str, first_line: int, globals: Mapping[str, Any],
-                 call_site: Optional[Loc], function: Callable, ir_ctx: IRContext):
+    def __init__(self, filename: str, first_line: int, call_site: Optional[Loc],
+                 function: Callable, ir_ctx: IRContext):
         self.filename = filename
         self.first_line = first_line
-        self.globals = globals  # raw environment from user and builtins
         self.entry_point = call_site is None
         self.call_site = call_site
         self.function = function
@@ -129,12 +132,12 @@ class _Context:
         self.current_block.jump_loc = self.current_loc
 
     def store(self, var_name: str, value: hir.Operand):
-        self.call_void(_store_var, (var_name, value))
+        self.call_void(hir.store_var, (var_name, value))
         self.current_block.stored_names.add(var_name)
 
     def load(self, var_name: str) -> Var:
         # TODO: generate more helpful variable names
-        return self.call(_load_var, (var_name,))
+        return self.call(hir.load_var, (var_name,))
 
     def get_loc(self, node: ast.AST) -> Loc:
         line_no = _get_source_line_no(self.first_line, node.lineno)
@@ -570,138 +573,6 @@ def _stmt_list(statements: Sequence[ast.stmt], ctx: _Context):
             _stmt(stmt, ctx)
 
 
-class _VersionMap:
-    def __init__(self, ir_ctx: IRContext, parent: Optional["_VersionMap"] = None):
-        self._ir_ctx = ir_ctx
-        self._map = dict()
-        self._parent = parent
-
-    def redefine(self, name: str, loc: Loc) -> Var:
-        var = self._ir_ctx.make_var(name, loc)
-        self._map[name] = var
-        return var
-
-    def __getitem__(self, name: str):
-        var = self._lookup(name)
-        if var is None:
-            raise TileSyntaxError(f"Undefined variable {name} used")
-        return var
-
-    def get(self, name: str, loc: Loc):
-        var = self._lookup(name)
-        if var is None:
-            return self._ir_ctx.make_var(name, loc, undefined=True)
-        else:
-            return var
-
-    def _lookup(self, name: str) -> Optional[Var]:
-        seen = set()
-        current = self
-        while current is not None:
-            var = current._map.get(name)
-            if var is not None:
-                return var
-            # Sanity check, should not reach here.
-            if id(current) in seen:
-                raise RuntimeError("Cycle detected in VersionMap chain")
-            seen.add(id(current))
-            current = current._parent
-        return None
-
-    def branch(self) -> "_VersionMap":
-        return _VersionMap(self._ir_ctx, self)
-
-
-def _eliminate_load_store_for_call(
-    call: hir.Call,
-    version_map: _VersionMap,
-    all_locals: Set[str],
-    frozen_globals: Mapping[str, Any],
-    loop_stored_names: tuple[str, ...],
-) -> None:
-    if call.callee is _load_var:
-        name, = call.args
-        call.callee = hir.identity
-        if name in all_locals:
-            rhs = version_map[name]
-            if rhs.is_undefined():
-                raise TileSyntaxError(f"Undefined variable {name} used")
-            call.args = (rhs,)
-        elif name in frozen_globals:
-            const_val = get_constant_value(frozen_globals[name])
-            call.args = (const_val,)
-        else:
-            raise TileSyntaxError(f"Undefined variable {name} used")
-    elif call.callee is _store_var:
-        name, value = call.args
-        var = version_map.redefine(name, call.loc)
-        call.callee = hir.identity
-        call.args = (value,)
-        call.results = (var,)
-    elif call.callee is hir.loop:
-        body_block, iterable = call.args
-
-        # Sort the carried variable names to make the order deterministic.
-        stored_names = tuple(sorted(body_block.stored_names))
-        call.args += tuple(version_map.get(name, call.loc) for name in stored_names)
-        body_block.params += tuple(version_map.redefine(name, call.loc)
-                                   for name in stored_names)
-
-        _eliminate_load_store_in_block(body_block, version_map,
-                                       all_locals, frozen_globals,
-                                       stored_names, ())
-
-        call.results += tuple(version_map.redefine(name, call.loc) for name in stored_names)
-    elif call.callee is hir.if_else:
-        _cond, then_block, else_block = call.args
-
-        # Sort the stored variable names to make the order deterministic.
-        stored_names = tuple(sorted(then_block.stored_names | else_block.stored_names))
-
-        for nested_block in (then_block, else_block):
-            _eliminate_load_store_in_block(nested_block, version_map.branch(),
-                                           all_locals, frozen_globals,
-                                           loop_stored_names, stored_names)
-
-        if then_block.jump is hir.Jump.END_BRANCH or else_block.jump is hir.Jump.END_BRANCH:
-            call.results += tuple(version_map.redefine(name, call.loc) for name in stored_names)
-
-
-def _eliminate_load_store_in_block(
-    block: hir.Block,
-    version_map: _VersionMap,
-    all_locals: Set[str],
-    frozen_globals: Mapping[str, Any],
-    loop_stored_names: tuple[str, ...],
-    ifelse_stored_names: tuple[str, ...],
-) -> None:
-    for call in block.calls:
-        with call.loc:
-            _eliminate_load_store_for_call(call, version_map, all_locals, frozen_globals,
-                                           loop_stored_names)
-
-    match block.jump:
-        case hir.Jump.CONTINUE | hir.Jump.BREAK:
-            stored_names = loop_stored_names
-        case hir.Jump.END_BRANCH:
-            stored_names = ifelse_stored_names
-        case hir.Jump.RETURN | None:
-            stored_names = ()
-        case _: assert False
-
-    block.results += tuple(version_map.get(name, block.jump_loc) for name in stored_names)
-
-
-def _eliminate_load_store(root_block: hir.Block,
-                          all_params: Sequence[ast.arg],
-                          ctx: _Context):
-    version_map = _VersionMap(ctx.ir_ctx)
-    root_block.params = tuple(version_map.redefine(p.arg, ctx.get_loc(p)) for p in all_params)
-    root_block.stored_names.update({p.arg for p in all_params})
-    _eliminate_load_store_in_block(root_block, version_map, root_block.stored_names, ctx.globals,
-                                   loop_stored_names=(), ifelse_stored_names=())
-
-
 def _get_all_parameters(func_def: ast.FunctionDef, ctx: _Context) -> List[ast.arg]:
     for a in (func_def.args.vararg, func_def.args.kwarg):
         if a is not None:
@@ -737,14 +608,4 @@ def _ast2hir(func_def: ast.FunctionDef, ctx: _Context) -> hir.Block:
             ctx.call_void(hir.loop, (body_block, None))
             retval = ctx.load("$retval")
             root_block.results = (retval,)
-
-    all_params = _get_all_parameters(func_def, ctx)
-    _eliminate_load_store(root_block, all_params, ctx)
     return root_block
-
-
-# _store_var() and _load_var() are function stubs used to model named variable assignment and use.
-# They only exist in the initial HIR building phase, and then removed by the `_eliminate_load_store`
-# pass that converts the HIR to an SSA form.
-def _store_var(name, value, /): ...
-def _load_var(name, /): ...

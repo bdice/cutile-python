@@ -17,12 +17,13 @@ from cuda.tile import RoundingMode, MemoryOrder, MemoryScope
 from cuda.tile._mutex import tile_mutex
 from cuda.tile._exception import (
     TileTypeError,
-    ConstFoldNotImplementedError,
+    ConstFoldNotImplementedError, TileSyntaxError,
 )
 from cuda.tile._ir.ir import (
     Operation, Var, Loc, Block,
     has_side_effects, terminator, add_operation, TypedOperation, RangeInfo, Builder,
-    has_multiple_results, nested_block, PhiState, LoopInfo, get_innermost_loop, LoopVarState
+    has_multiple_results, nested_block, PhiState, LoopInfo, LoopVarState,
+    IfElseInfo
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
@@ -47,7 +48,7 @@ from .ops_utils import (
     memory_scope_to_bytecode, broadcast_shapes2, is_shape_broadcastable_to, BroadcastError,
     promote_types, promote_dtypes, check_implicit_cast
 )
-from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval
+from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval, get_constant_value
 from .type import (
     TupleTy, TileTy, NoneType, BoundMethodTy, SizeTy, ArrayTy,
     ListTy, make_tile_ty, SliceType, DTypeConstructor, PointerTy, RangeIterType, Type,
@@ -64,7 +65,6 @@ from cuda.tile._ir2bytecode import (
     get_list_partition_view_tile_size
 )
 import cuda.tile._bytecode as bc
-from .._passes.ast2hir import _store_var, _load_var
 
 
 # ================================================
@@ -164,7 +164,7 @@ class Loop(TypedOperation):
 
 
 @impl(hir.loop)
-def loop_impl(body: hir.Block, iterable: Var, initial_values: tuple[Var, ...]):
+def loop_impl(body: hir.Block, iterable: Var):
     from .._passes.hir2ir import dispatch_hir_block
 
     range_ty = require_optional_range_type(iterable)
@@ -172,42 +172,50 @@ def loop_impl(body: hir.Block, iterable: Var, initial_values: tuple[Var, ...]):
         # In ast2hir, we create a loop around the body in order to support early returns.
         # But if there is no early return, we can remove the loop. In this case the loop
         # will only have a "break" at the end of the body, and no other break/continue statements.
-        for initial_var, body_var in zip(initial_values, body.params, strict=True):
-            assign(initial_var, body_var)
-        return dispatch_hir_block(body, ignore_jump=True)
+        info = LoopInfo((), False, (), flatten=True)
+        with Builder.get_current().change_loop_info(info):
+            dispatch_hir_block(body)
+        return ()
 
-    var_states = tuple(LoopVarState(PhiState(), PhiState()) for _ in initial_values)
+    builder = Builder.get_current()
+    local_scope = builder.scope.local
+    stored_names = tuple(sorted(body.stored_names))
+    var_states = tuple(LoopVarState(PhiState(), PhiState()) for _ in stored_names)
+    initial_values = tuple(local_scope.get(name, builder.loc) for name in stored_names)
 
     if range_ty is not None:
-        body_vars = body.params[1:]
         for initial_var, state in zip(initial_values, var_states, strict=True):
             state.result_phi.propagate(initial_var)
         # Assign type to induction variable
         body.params[0].set_type(range_ty.dtype)
-    else:
-        body_vars = body.params
 
-    for initial_var, body_var, state in zip(initial_values, body_vars, var_states, strict=True):
-        state.body_phi.set_nonconstant()
-        state.body_phi.propagate(initial_var, allow_loose_typing=False)
-        body_var.set_type(state.body_phi.ty)
+    with local_scope.enter_branch():
+        body_vars = []
+        for name, initial_var, state in zip(stored_names, initial_values, var_states, strict=True):
+            state.body_phi.set_nonconstant()
+            state.body_phi.propagate(initial_var, allow_loose_typing=False)
+            body_var = local_scope.redefine(name, state.body_phi.last_loc)
+            body_var.set_type(state.body_phi.ty)
+            body_vars.append(body_var)
 
-    loop_info = LoopInfo(var_states, range_ty is not None)
-    with nested_block(body.name, body.loc, body.params, loop_info) as new_body:
-        dispatch_hir_block(body)
+        loop_info = LoopInfo(var_states, range_ty is not None, stored_names)
+        params = body.params + tuple(body_vars)
+        with nested_block(body.name, body.loc, params, loop_info=loop_info) as new_body:
+            dispatch_hir_block(body)
 
-    for body_var, state in zip(body_vars, var_states, strict=True):
-        state.finalize_loopvar_type(body_var)
+        for body_var, state in zip(body_vars, var_states, strict=True):
+            state.finalize_loopvar_type(body_var)
 
     result_vars = add_operation(Loop, (None,) * len(var_states),
                                 iterable=None if range_ty is None else iterable,
                                 initial_values=initial_values,
                                 body=new_body)
 
-    for res, state in zip(result_vars, var_states, strict=True):
+    for res, state, name in zip(result_vars, var_states, stored_names, strict=True):
         state.result_phi.finalize(res)
+        store_var(name, res, state.result_phi.last_loc)
 
-    return result_vars
+    return ()
 
 
 def _have_nested_jump(calls: Sequence[hir.Call]) -> bool:
@@ -269,42 +277,73 @@ class IfElse(TypedOperation):
         return f"if(cond={self.cond})"
 
 
+def _flatten_branch(branch: hir.Block) -> tuple[Var, ...]:
+    from .._passes.hir2ir import dispatch_hir_block
+    info = IfElseInfo((), (), flatten=True)
+    with Builder.get_current().change_if_else_info(info):
+        dispatch_hir_block(branch)
+    return info.flattened_results
+
+
 @impl(hir.if_else)
-def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tuple[Var, ...] | None:
+def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tuple[Var, ...]:
     from .._passes.hir2ir import dispatch_hir_block
 
     require_bool(cond)
     if cond.is_constant():
         branch_taken = then_block if cond.get_constant() else else_block
-        have_end_branch = branch_taken.jump == hir.Jump.END_BRANCH
-        return dispatch_hir_block(branch_taken, ignore_jump=have_end_branch)
+        return _flatten_branch(branch_taken)
+
+    # Figure out the number of explicit results
+    num_explicit_results = 0
+    if then_block.jump == hir.Jump.END_BRANCH:
+        num_explicit_results = len(then_block.results)
+    elif else_block.jump == hir.Jump.END_BRANCH:
+        num_explicit_results = len(else_block.results)
+
+    # Get the total number of results by adding the number of stored variables.
+    # Note: we sort the stored variable names to make the order deterministic.
+    stored_names = tuple(sorted(then_block.stored_names | else_block.stored_names))
+    num_results = num_explicit_results + len(stored_names)
+
+    # Initialize an IfElseInfo struct
+    result_phis = tuple(PhiState() for _ in range(num_results))
+    info = IfElseInfo(result_phis, stored_names)
 
     # Convert each branch from HIR to IR
-    with nested_block(then_block.name, then_block.loc) as new_then_block:
-        then_results = dispatch_hir_block(then_block)
-    with nested_block(else_block.name, else_block.loc) as new_else_block:
-        else_results = dispatch_hir_block(else_block)
+    with nested_block(then_block.name, then_block.loc, if_else_info=info) as new_then_block:
+        dispatch_hir_block(then_block)
 
-    # Figure out the number of results
-    branch_results = []
-    if then_block.jump == hir.Jump.END_BRANCH:
-        branch_results.append(then_results)
-    if else_block.jump == hir.Jump.END_BRANCH:
-        branch_results.append(else_results)
+    # If "then" branch doesn't yield, transform our if-else into the following:
+    #    if cond:
+    #        <then_block>
+    #    else:
+    #        EndBranch
+    #    <else_block>
+    # This is to avoid the situation where none of the branches yield.
+    if not info.have_end_branch:
+        info = IfElseInfo((), ())
+        with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
+            end_branch(())
+        add_operation(IfElse, (),
+                      cond=cond, then_block=new_then_block, else_block=new_else_block)
+        return _flatten_branch(else_block)
+
+    with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
+        dispatch_hir_block(else_block)
 
     # Generate an IfElse op. Don't set result types yet -- phi.finalize() will do the work.
-    num_results = 0 if len(branch_results) == 0 else len(branch_results[0])
     result_vars = add_operation(IfElse, (None,) * num_results,
                                 cond=cond, then_block=new_then_block, else_block=new_else_block)
-
     # Infer the result types & constants
-    phi_states = tuple(PhiState() for _ in range(num_results))
-    for br in branch_results:
-        for res, phi in zip(br, phi_states, strict=True):
-            phi.propagate(res)
-    for var, phi, in zip(result_vars, phi_states, strict=True):
+    for var, phi in zip(result_vars, result_phis, strict=True):
         phi.finalize(var)
-    return result_vars
+
+    # Update the scope
+    for var, phi, name in zip(result_vars[num_explicit_results:],
+                              result_phis[num_explicit_results:], stored_names, strict=True):
+        store_var(name, var, phi.last_loc)
+    return result_vars[:num_explicit_results]
 
 
 # Maps to ContinueOp in TileIR
@@ -330,13 +369,17 @@ class Continue(TypedOperation):
         return f"continue {', '.join([x.name for x in self.next_vars])}"
 
 
-def continue_(next_values):
-    loop_info = get_innermost_loop()
-    assert loop_info is not None
+def continue_():
+    builder = Builder.get_current()
+    info = builder.loop_info
+    assert info is not None
+    assert not info.flatten
 
-    for nextval, state in zip(next_values, loop_info.var_states):
+    next_values = tuple(builder.scope.local.get(name, builder.loc)
+                        for name in info.stored_names)
+    for nextval, state in zip(next_values, info.var_states):
         state.body_phi.propagate(nextval, fail_eagerly=True)
-        if loop_info.is_for_loop:
+        if info.is_for_loop:
             state.result_phi.propagate(nextval)
 
     add_operation(Continue, (), next_vars=next_values)
@@ -368,14 +411,20 @@ class Break(TypedOperation):
         return f"break {', '.join([x.name for x in self.output_vars])}"
 
 
-def break_(result_values):
-    loop_info = get_innermost_loop()
-    assert loop_info is not None
+def break_():
+    builder = Builder.get_current()
+    info = builder.loop_info
+    assert info is not None
 
-    for nextval, state in zip(result_values, loop_info.var_states, strict=True):
-        state.result_phi.propagate(nextval)
+    if info.flatten:
+        return
 
-    add_operation(Break, (), output_vars=result_values)
+    outputs = tuple(builder.scope.local.get(name, builder.loc)
+                    for name in info.stored_names)
+    for val, state in zip(outputs, info.var_states, strict=True):
+        state.result_phi.propagate(val)
+
+    add_operation(Break, (), output_vars=outputs)
 
 
 # Maps to YieldOp
@@ -402,7 +451,18 @@ class EndBranch(TypedOperation):
 
 
 def end_branch(outputs):
-    add_operation(EndBranch, (), outputs=outputs)
+    builder = Builder.get_current()
+    info = builder.if_else_info
+    if info.flatten:
+        info.flattened_results = outputs
+        return
+    extra_outputs = tuple(builder.scope.local.get(name, builder.loc)
+                          for name in info.stored_names)
+    all_outputs = outputs + extra_outputs
+    for phi, res in zip(info.result_phis, all_outputs, strict=True):
+        phi.propagate(res)
+    info.have_end_branch = True
+    add_operation(EndBranch, (), outputs=all_outputs)
 
 
 @terminator
@@ -3298,14 +3358,35 @@ def tile_item(tile: Var) -> Var:
     return add_operation(TileItem, x_ty.dtype, x=tile)
 
 
-@impl(_store_var)
-def store_var_impl(name, value):
-    raise AssertionError("_store_var must have been eliminated")
+def store_var(name: str, value: Var, loc: Loc | None = None):
+    builder = Builder.get_current()
+    local_scope = builder.scope.local
+    assert local_scope.is_local_name(name)
+    new_var = local_scope.redefine(name, loc or builder.loc)
+    assign(value, new_var)
 
 
-@impl(_load_var)
+@impl(hir.store_var)
+def store_var_impl(name: Var, value: Var):
+    name = require_constant_str(name)
+    store_var(name, value)
+
+
+@impl(hir.load_var)
 def load_var_impl(name):
-    raise AssertionError("_load_var must have been eliminated")
+    name = require_constant_str(name)
+    builder = Builder.get_current()
+    local_scope = builder.scope.local
+    if local_scope.is_local_name(name):
+        ret = local_scope[name]
+        if ret.is_undefined():
+            raise TileSyntaxError(f"Undefined variable {name} used")
+        return ret
+    elif name in builder.scope.frozen_globals:
+        const_val = get_constant_value(builder.scope.frozen_globals[name])
+        return loosely_typed_const(const_val)
+    else:
+        raise TileSyntaxError(f"Undefined variable {name} used")
 
 
 LoadMemoryOperation = TileLoad | LoadPointer

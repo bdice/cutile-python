@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import traceback
-from typing import Callable, Optional
+from typing import Callable, Optional, Any, Set
 import zipfile
 
 from cuda.tile._cext import get_compute_capability, TileContext, default_tile_context
@@ -25,10 +25,11 @@ from cuda.tile._const_utils import get_constant_annotations
 from cuda.tile._exception import (
     TileCompilerError,
     TileCompilerExecutionError,
-    TileCompilerTimeoutError,
+    TileCompilerTimeoutError, TileValueError, TileTypeError
 )
 from cuda.tile._ir import ir, hir
-from cuda.tile._ir.ir import bind_kernel_arguments
+from cuda.tile._ir.ir import Argument
+from cuda.tile._ir.typing_support import typeof_pyval, get_constant_value
 from cuda.tile._passes.ast2hir import get_function_hir
 from cuda.tile._passes.code_motion import hoist_loop_invariants
 from cuda.tile._passes.eliminate_assign_ops import eliminate_assign_ops
@@ -74,9 +75,9 @@ def global_compiler_lock(func):
 
 def _get_final_ir(pyfunc, args, tile_context) -> ir.Block:
     ir_ctx = ir.IRContext(tile_context)
-    func_hir: hir.Block = get_function_hir(pyfunc, ir_ctx, call_site=None)
+    func_hir: hir.Function = get_function_hir(pyfunc, ir_ctx, call_site=None)
 
-    ir_args = bind_kernel_arguments(func_hir.params, args, get_constant_annotations(pyfunc))
+    ir_args = _bind_kernel_arguments(func_hir.param_names, args, get_constant_annotations(pyfunc))
     func_body = hir2ir(func_hir, ir_args, ir_ctx)
     eliminate_assign_ops(func_body)
     dead_code_elimination_pass(func_body)
@@ -94,6 +95,34 @@ def _get_final_ir(pyfunc, args, tile_context) -> ir.Block:
     split_loops(func_body)
     dead_code_elimination_pass(func_body)
     return func_body
+
+
+def _bind_kernel_arguments(param_names: tuple[str, ...],
+                           args: tuple[Any, ...],
+                           constant_args: Set[str]) -> tuple[Argument, ...]:
+    # TODO: unify this logic with dispatcher from c extension
+    # Refactor "extract_cuda_args" to return type descriptor
+    # that can be wrapped as IR Type for type inference.
+    if len(args) != len(param_names):
+        msg = f"Expected {len(param_names)} arguments, got {len(args)}"
+        raise TileValueError(msg)
+
+    ir_args = []
+    for param_name, arg_value in zip(param_names, args, strict=True):
+        const_val = None
+        is_const = param_name in constant_args
+        ty = typeof_pyval(arg_value, kernel_arg=not is_const)
+        if is_const:
+            try:
+                const_val = get_constant_value(arg_value)
+            except TileTypeError:
+                raise TileTypeError(
+                    f"Argument `{param_name}` is a constexpr, "
+                    f"but the value is not a supported constant.")
+        ir_args.append(Argument(type=ty,
+                                is_const=is_const,
+                                const_value=const_val))
+    return tuple(ir_args)
 
 
 def _log_mlir(bytecode_buf):

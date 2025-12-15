@@ -151,6 +151,31 @@ def test_fold_if_break_in_loop():
     compile_tile(kernel, (), CompilerOptions())
 
 
+def test_fold_nested_if_both_early_terminators_in_loop():
+
+    @ct.kernel
+    def kernel(x):
+        i = 0
+        a = 10
+        while True:
+            if ct.bid(0) == i:
+                a += 3
+                if True:
+                    break
+                a = 30
+            else:
+                a = 20
+                i += 1
+                if True:
+                    continue
+                a = 40
+        ct.scatter(x, ct.bid(0), a)
+
+    x = torch.zeros((2,), dtype=torch.int32, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (2,), kernel, (x,))
+    assert x.tolist() == [13, 23]
+
+
 def plus_one(x):
     return x + 1
 

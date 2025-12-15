@@ -48,7 +48,7 @@ def test_unused_body_var():
     loop, = [op for op in func_body if isinstance(op, Loop)]
 
     # The initial variable should be undefined because it is never used
-    t_idx = [v.get_original_name() for v in loop.result_vars].index("t")
+    t_idx = [v.get_original_name() for v in loop.body.params].index("t")
     assert loop.initial_values[t_idx].is_undefined()
 
     # The yielded variable should also be undefined because it is never used

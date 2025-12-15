@@ -17,7 +17,7 @@
 import enum
 from dataclasses import dataclass
 from textwrap import indent
-from typing import Any, Set
+from typing import Any, Set, Mapping
 
 from cuda.tile._exception import Loc
 from cuda.tile._ir.ir import Var
@@ -96,6 +96,14 @@ class Block:
 
 
 @dataclass
+class Function:
+    body: Block
+    param_names: tuple[str, ...]
+    param_locs: tuple[Loc, ...]
+    frozen_globals: Mapping[str, Any]
+
+
+@dataclass
 class _OperandFormatter:
     blocks: list["Block"]
 
@@ -118,6 +126,8 @@ class _OperandFormatter:
 # ==================================
 
 def if_else(cond, then_block, else_block, /): ...
-def loop(body, iterable, /, *initial_values): ...  # infinite if `iterable` is None
+def loop(body, iterable, /): ...  # infinite if `iterable` is None
 def build_tuple(*items): ...  # Makes a tuple (i.e. returns `items`)
 def identity(x): ...   # Identity function (i.e. returns `x`)
+def store_var(name, value, /): ...  # Store into a named variable
+def load_var(name, /): ...  # Load from a named variable

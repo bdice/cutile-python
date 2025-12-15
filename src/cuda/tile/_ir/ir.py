@@ -18,11 +18,8 @@ from typing import (
     List, Optional, Dict, Tuple, Set, Any, TYPE_CHECKING, Sequence, Iterator
 )
 from .type import Type, InvalidType
-from .typing_support import typeof_pyval, get_constant_value, loose_type_of_pyval
 from cuda.tile._exception import (
-    TileTypeError,
-    TileValueError,
-    Loc, TileInternalError
+    TileTypeError, Loc, TileInternalError, TileSyntaxError
 )
 from .._cext import TileContext
 
@@ -308,28 +305,122 @@ class LoopVarState:
 class LoopInfo:
     var_states: tuple[LoopVarState, ...]
     is_for_loop: bool
+    stored_names: tuple[str, ...]
+    flatten: bool = False
 
 
-def get_innermost_loop() -> LoopInfo | None:
-    return Builder.get_current().loop_info
+@dataclass
+class IfElseInfo:
+    result_phis: tuple[PhiState, ...]
+    stored_names: tuple[str, ...]
+    flatten: bool = False
+    flattened_results: tuple[Var, ...] = ()
+    have_end_branch: bool = False
 
 
 @contextmanager
 def nested_block(name: str, loc: Loc, params: Sequence[Var] = (),
-                 loop_info: LoopInfo | None = None):
+                 loop_info: LoopInfo | None = None,
+                 if_else_info: IfElseInfo | None = None):
     prev_builder = Builder.get_current()
     block = Block(prev_builder.ir_ctx, params=params, name=name, loc=loc)
     new_loop_info = loop_info or prev_builder.loop_info
-    with Builder(prev_builder.ir_ctx, loc, new_loop_info) as builder:
+    new_if_else_info = if_else_info or prev_builder.if_else_info
+    scope = prev_builder.scope
+    with Builder(prev_builder.ir_ctx, loc, scope, new_loop_info, new_if_else_info) as builder, \
+            scope.local.enter_branch():
         yield block
     block.extend(builder.ops)
 
 
+class LocalScope:
+    def __init__(self,
+                 all_locals: Set[str],
+                 ir_ctx: IRContext,
+                 parent: Optional["LocalScope"] = None):
+        self._all_locals = all_locals
+        self._ir_ctx = ir_ctx
+        self._map = dict()
+        self._parent = parent
+
+    def is_local_name(self, name: str):
+        current = self
+        while current is not None:
+            if name in current._all_locals:
+                return True
+            current = current._parent
+        return False
+
+    def redefine(self, name: str, loc: Loc) -> Var:
+        var = self._ir_ctx.make_var(name, loc)
+        self._map[name] = var
+        return var
+
+    def __getitem__(self, name: str):
+        var = self._lookup(name)
+        if var is None:
+            raise TileSyntaxError(f"Undefined variable {name} used")
+        return var
+
+    def get(self, name: str, loc: Loc):
+        var = self._lookup(name)
+        if var is None:
+            return self._ir_ctx.make_var(name, loc, undefined=True)
+        else:
+            return var
+
+    def _lookup(self, name: str) -> Optional[Var]:
+        seen = set()
+        current = self
+        while current is not None:
+            var = current._map.get(name)
+            if var is not None:
+                return var
+            # Sanity check, should not reach here.
+            if id(current) in seen:
+                raise RuntimeError("Cycle detected in Scope chain")
+            seen.add(id(current))
+            current = current._parent
+        return None
+
+    @contextmanager
+    def enter_branch(self):
+        old = self._map
+        self._map = _OverlayDict(old)
+        try:
+            yield
+        finally:
+            self._map = old
+
+
+class _OverlayDict:
+    def __init__(self, orig_dict: dict):
+        self._orig = orig_dict
+        self._overlay = dict()
+
+    def get(self, key):
+        value = self._overlay.get(key)
+        return self._orig.get(key) if value is None else value
+
+    def __setitem__(self, key, value):
+        self._overlay[key] = value
+
+
+@dataclass
+class Scope:
+    local: LocalScope
+    frozen_globals: Mapping[str, Any]
+
+
 class Builder:
-    def __init__(self, ctx: IRContext, loc: Loc, loop_info: LoopInfo | None = None):
+    def __init__(self, ctx: IRContext, loc: Loc, scope: Scope,
+                 loop_info: LoopInfo | None = None,
+                 if_else_info: IfElseInfo | None = None):
         self.ir_ctx = ctx
+        self.scope = scope
         self.is_terminated = False
         self.loop_info = loop_info
+        self.if_else_info = if_else_info
         self._loc = loc
         self._ops = []
         self._entered = False
@@ -363,6 +454,10 @@ class Builder:
     def ops(self) -> list[Operation]:
         return self._ops
 
+    @property
+    def loc(self) -> Loc:
+        return self._loc
+
     def append_verbatim(self, op: Operation):
         self._ops.append(op)
 
@@ -383,6 +478,24 @@ class Builder:
             yield
         finally:
             self._loc = old_loc
+
+    @contextmanager
+    def change_if_else_info(self, new_info: IfElseInfo):
+        old = self.if_else_info
+        self.if_else_info = new_info
+        try:
+            yield
+        finally:
+            self.if_else_info = old
+
+    @contextmanager
+    def change_loop_info(self, new_info: LoopInfo):
+        old = self.loop_info
+        self.loop_info = new_info
+        try:
+            yield
+        finally:
+            self.loop_info = old
 
     def __enter__(self):
         assert not self._entered
@@ -685,69 +798,8 @@ class Block:
         return self.to_string()
 
 
-def bind_kernel_arguments(params: Tuple[Var, ...],
-                          args: Tuple[Any, ...],
-                          constant_args: Set[str]) -> Tuple[Argument, ...]:
-    # TODO: unify this logic with dispatcher from c extension
-    # Refactor "extract_cuda_args" to return type descriptor
-    # that can be wrapped as IR Type for type inference.
-    if len(args) != len(params):
-        msg = f"Expected {len(params)} arguments, got {len(args)}"
-        raise TileValueError(msg)
-
-    ir_args = []
-    for param, arg_value in zip(params, args):
-        const_val = None
-        is_const = param.name in constant_args
-        ty = typeof_pyval(arg_value, kernel_arg=not is_const)
-        loose_type = ty
-        if is_const:
-            try:
-                const_val = get_constant_value(arg_value)
-            except TileTypeError:
-                raise TileTypeError(
-                    f"Argument {param.name} is a constexpr, "
-                    f"but the value is not a supported constant.")
-            loose_type = loose_type_of_pyval(arg_value)
-        ir_args.append(Argument(type=ty,
-                                loose_type=loose_type,
-                                is_const=is_const,
-                                const_value=const_val))
-    return tuple(ir_args)
-
-
+@dataclass
 class Argument:
-    def __init__(self,
-                 type: Type,
-                 loose_type: Type,
-                 is_const: bool = False,
-                 const_value: Any = None):
-        self._type = type
-        self._loose_type = loose_type
-        self._is_const = is_const
-        self._const_value = const_value
-
-    @property
-    def is_const(self) -> bool:
-        return self._is_const
-
-    @property
-    def const_value(self) -> Any:
-        return self._const_value
-
-    @property
-    def type(self) -> Type:
-        return self._type
-
-    @property
-    def loose_type(self) -> Type:
-        return self._loose_type
-
-    def __eq__(self, value: object) -> bool:
-        if not isinstance(value, Argument):
-            return False
-        return (
-            self.type == value.type and
-            self.is_const == value.is_const and
-            self.const_value == value.const_value
-        )
+    type: Type
+    is_const: bool = False
+    const_value: Any = None

@@ -82,8 +82,7 @@ def mma_uninitialized_var_in_if(A, B, C,
     bidy = ct.bid(1)
     a = ct.load(A, index=(bidx, 0), shape=(tm, tk))
     b = ct.load(B, index=(0, bidy), shape=(tk, tn))
-    # We don't have constant folding for the if statement.
-    if tm > 1:
+    if bidx == 0:
         acc = ct.full((tm, tn), 0, dtype=C.dtype)
         acc = ct.mma(a, b, acc)
     else:
