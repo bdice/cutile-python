@@ -1015,3 +1015,20 @@ def test_early_return(early_return):
     else:
         ref_result = x + y
     assert_equal(z, ref_result)
+
+
+def test_yield_previously_undefined_tuple_from_loop():
+    @ct.kernel
+    def kernel(x):
+        i = 0
+        while True:
+            if i > 0:
+                tx = ct.gather(x, ()) + i
+                tx2 = (tx, tx)
+                break
+            i += 10
+        ct.scatter(x, (), tx2[0])
+
+    x = torch.ones((), dtype=torch.int32, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (1,), kernel, (x,))
+    assert x.item() == 11

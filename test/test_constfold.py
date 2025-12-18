@@ -223,3 +223,19 @@ def test_dtype_in_for_loop():
         ct.full((1, 1), 1.0, dtype=dtype)
 
     compile_tile(kernel, (), CompilerOptions())
+
+
+def test_semi_constant_tuple_yielded_by_ifelse():
+    @ct.kernel
+    def kernel(x):
+        if ct.bid(0) == 0:
+            tup = (ct.bid(1), 4)
+        else:
+            tup = (ct.bid(0), 4)
+        # Use tup[1] in a context that requires it to be constant
+        tx = ct.arange(tup[1], dtype=x.dtype)
+        ct.store(x, (0,), tx)
+
+    x = torch.zeros((4,), dtype=torch.int32, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (1,), kernel, (x,))
+    assert x.tolist() == [0, 1, 2, 3]

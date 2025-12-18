@@ -38,7 +38,7 @@ def dead_code_elimination_pass(root_block: Block) -> None:
 # rule names):
 #
 #   (CF_COND)
-#       IfElse depends on its `cond` variable; Loop with a for_loop depends on its `iterable`.
+#       IfElse depends on its `cond` variable; a for Loop depends on its `start/stop/step`.
 #       For example, `$cf.1` will depend on `$1` here:
 #
 #           if $1:    [$cf.1]
@@ -106,9 +106,11 @@ def _build_dataflow_graph(graph: Dict[str, List[str] | Tuple[str, ...]],
             if innermost_cf_name is not None:
                 graph[cf_name].append(innermost_cf_name)
 
-            if op.iterable is not None:
+            if op.is_for_loop:
                 # See rule `CF_COND`
-                graph[cf_name].append(op.iterable.name)
+                graph[cf_name].append(op.start.name)
+                graph[cf_name].append(op.stop.name)
+                graph[cf_name].append(op.step.name)
 
                 # `For` loop can run for zero iterations, which means that initial values
                 # of loop variables may flow directly into the loop's result variables.
@@ -129,7 +131,7 @@ def _build_dataflow_graph(graph: Dict[str, List[str] | Tuple[str, ...]],
 
             # In a `for` loop, "next" values can also feed into the loop's results.
             # That's because the loop can immediately exit if the iterator has been exhausted.
-            if innermost_loop.iterable is not None:
+            if innermost_loop.is_for_loop:
                 for res_var, next_var in zip(innermost_loop.result_vars, op.values, strict=True):
                     graph[res_var.name].append(next_var.name)
         elif isinstance(op, Break):
@@ -207,12 +209,12 @@ def _prune_block(block: Block,
                 _mark_unused_vars_as_undefined(op.initial_values, mask, used_vars)
                 new_initial_values = _select_by_mask(op.initial_values, mask)
                 new_body_vars = _select_by_mask(op.body_vars, mask)
-                op.body.params = (new_body_vars if op.iterable is None
-                                  else (op.body.params[0], *new_body_vars))
+                op.body.params = ((op.body.params[0], *new_body_vars)
+                                  if op.is_for_loop else new_body_vars)
                 new_result_vars = _select_by_mask(op.result_vars, mask)
                 _prune_block(op.body, used_vars, op_to_cf_name, mask, ())
-                new_ops.append(Loop(op.iterable, new_initial_values, new_result_vars, op.body,
-                                    op.loc))
+                new_ops.append(Loop(op.start, op.stop, op.step, new_initial_values, new_result_vars,
+                                    op.body, op.loc))
         elif isinstance(op, Continue):
             _mark_unused_vars_as_undefined(op.values, loop_mask, used_vars)
             next_vars = _select_by_mask(op.values, loop_mask)

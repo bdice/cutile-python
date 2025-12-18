@@ -16,7 +16,7 @@ class FunctionDesc:
     line: int
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class Loc:
     line: int
     col: int
@@ -135,10 +135,6 @@ class TileValueError(TileError):
 
 
 class TileInternalError(TileError):
-    pass
-
-
-class ConstFoldNotImplementedError(Exception):
     pass
 
 

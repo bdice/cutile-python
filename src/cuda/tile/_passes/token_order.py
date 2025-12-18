@@ -8,14 +8,14 @@ from enum import Enum, IntEnum, auto
 from types import MappingProxyType
 from typing import Tuple, Dict, Set, Optional
 
-from cuda.tile._ir.type import TupleTy, TokenTy
+from cuda.tile._ir.type import TokenTy
 from cuda.tile._memory_model import MemoryOrder
 from cuda.tile._exception import Loc, TileInternalError
 from cuda.tile._ir.ir import Block, IRContext, Var, Operation
 from cuda.tile._ir.ops import (
-    Assign, Break, BuildTuple, Continue, EndBranch, IfElse,
+    Assign, Break, Continue, EndBranch, IfElse,
     JoinTokens, LoadMemoryOperation, Loop, MakeToken,
-    MemoryOperation, Range, StoreMemoryOperation, TileAtomicCAS, TileAtomicCASTokenOrdered,
+    MemoryOperation, StoreMemoryOperation, TileAtomicCAS, TileAtomicCASTokenOrdered,
     TileAtomicRMW, TileAtomicRMWTokenOrdered, LoadPointer, LoadPointerTokenOrdered,
     TileLoad, TileLoadTokenOrdered, StorePointer, StorePointerTokenOrdered,
     TileStore, TileStoreTokenOrdered,
@@ -101,7 +101,6 @@ class InnermostLoopInfo:
 @dataclass(frozen=True)
 class VarInfo:
     root_var: Dict[str, str]
-    defining_op: Dict[str, Operation]
 
 
 @dataclass(frozen=True)
@@ -170,21 +169,19 @@ def _get_block_memory_effects(block: Block,
     block_memory_effects[block] = blk_mem_effects
 
 
+# TODO: Assign ops should be gone at this point. Need to verify this and remove this logic.
 def _get_var_info(root_block: Block) -> VarInfo:
-    defining_op = dict()
     root_var = dict()
 
     def traverse(block: Block):
         for op in block.operations:
             if isinstance(op, Assign):
                 root_var[op.result_var.name] = root_var.get(op.value.name, op.value.name)
-            for v in op.result_vars:
-                defining_op[v.name] = op
             for block in op.nested_blocks:
                 traverse(block)
 
     traverse(root_block)
-    return VarInfo(root_var, defining_op)
+    return VarInfo(root_var)
 
 
 def _to_token_order_in_block(block: Block,
@@ -316,8 +313,8 @@ def _to_token_order_in_block(block: Block,
                                                                            token_map))
 
             op.body.params = tuple(new_body_params)
-            new_loop_op = Loop(op.iterable, tuple(new_initial_values), tuple(new_result_vars),
-                               op.body, op.loc)
+            new_loop_op = Loop(op.start, op.stop, op.step, tuple(new_initial_values),
+                               tuple(new_result_vars), op.body, op.loc)
             operations.append(new_loop_op)
 
             token_map = result_token_map
@@ -495,7 +492,7 @@ def _get_parallel_stores(
     Common in LayerNorm and RMSNorm patterns.
     """
 
-    if loop_op.iterable is None:
+    if not loop_op.is_for_loop:
         return set()
 
     # Skips this optimization if alias_set size > 1 is present in the loop body
@@ -547,35 +544,12 @@ def _filter_by_store_index(loop_op: Loop,
 
     def is_idx_injective(idx_var: Var) -> bool:
         root_idx_var = var_info.root_var.get(idx_var.name, idx_var.name)
-        if loop_op.iterable is not None and root_idx_var == loop_op.induction_var.name:
-            iterable = loop_op.iterable.name
-            iterable = var_info.root_var.get(iterable, iterable)
-            return isinstance(var_info.defining_op.get(iterable), Range)
         # TODO: allow more complex injective check: j = i * 2 + 3
-        return False
+        return loop_op.is_for_loop and root_idx_var == loop_op.induction_var.name
 
-    res = set()
-    for store_op in tile_store_candidates:
-        # TODO: support optimization on non-contiguous arrays
-        if not _get_input_var(store_op).get_type().elements_disjoint:
-            continue
-        # unpack index_var
-        index_ty = store_op.index.get_type()
-        if isinstance(index_ty, TupleTy):
-            root_var = var_info.root_var.get(store_op.index.name, store_op.index.name)
-            try:
-                # TODO: is it guanratee that the root_var has a defining op?
-                tuple_op = var_info.defining_op[root_var]
-                # TODO: handle case where tuple does not come from BuildTuple
-                assert isinstance(tuple_op, BuildTuple)
-            except (KeyError, AssertionError):
-                continue
-            unpacked = tuple_op.items
-        else:
-            unpacked = (store_op.index,)
-        if any(is_idx_injective(idx_var) for idx_var in unpacked):
-            res.add(store_op)
-    return res
+    return set(store_op for store_op in tile_store_candidates
+               if _get_input_var(store_op).get_type().elements_disjoint
+               and any(is_idx_injective(idx_var) for idx_var in store_op.index))
 
 
 def _try_loop_parallel_store(

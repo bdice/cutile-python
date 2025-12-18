@@ -16,12 +16,28 @@ from cuda.tile._exception import Loc
 
 if TYPE_CHECKING:
     from cuda.tile._datatype import DType
+    from cuda.tile._ir.ir import Var, AggregateValue
 
 
 import cuda.tile._bytecode as bc
 
 
 class Type:
+    def is_aggregate(self) -> bool:
+        return False
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        raise NotImplementedError()
+
+    def flatten_aggregate(self) -> Iterator["Type"]:
+        if self.is_aggregate():
+            for ty in self.aggregate_item_types():
+                yield from ty.flatten_aggregate()
+        else:
+            yield self
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        raise NotImplementedError()
 
     def __repr__(self):
         return str(self)
@@ -148,6 +164,16 @@ class TupleTy(Type):
     def __init__(self, value_types: Sequence[Type]):
         self._value_types = tuple(value_types)
 
+    def is_aggregate(self) -> bool:
+        return True
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        return self._value_types
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        from .ir import TupleValue
+        return TupleValue(items)
+
     def len(self) -> int:
         return len(self._value_types)
 
@@ -262,6 +288,12 @@ def make_tile_ty(dtype, shape: Sequence[int]):
 
 # ============== Array Type ===============
 
+
+def array_size_type() -> Type:
+    from .._datatype import int32
+    return TileTy(int32, TupleTy(()))
+
+
 class ArrayTy(Type):
     def __init__(self,
                  dtype,
@@ -291,6 +323,23 @@ class ArrayTy(Type):
         self.base_ptr_div_by = base_ptr_div_by
         self.stride_div_by = stride_div_by
         self.shape_div_by = shape_div_by
+
+    def is_aggregate(self) -> bool:
+        # Even though arrays are actually represented with TensorViews, they can't be
+        # propagated through control flow. So we need to be able to unpack the array
+        # into its individual (base_ptr, *shape, *strides) values.
+        return True
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        base_ptr_ty = PointerTy(self.dtype)
+        base_ptr_tile_ty = TileTy(base_ptr_ty, TupleTy(()))
+        size_ty = array_size_type()
+        return (base_ptr_tile_ty,) + (size_ty,) * (self.ndim * 2)
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        from .ir import ArrayValue
+        assert len(items) == 1 + 2 * self.ndim
+        return ArrayValue(items[0], items[1:self.ndim + 1], items[self.ndim + 1:])
 
     def unify(self, other: "ArrayTy") -> Optional["ArrayTy"]:
         if self.dtype != other.dtype or self.ndim != other.ndim:
@@ -351,6 +400,21 @@ class ArrayTy(Type):
 class ListTy(Type):
     item_type: Type
 
+    def is_aggregate(self) -> bool:
+        return True
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        from .._datatype import int32, int64
+        ptr_ty = PointerTy(int64)
+        ptr_tile_ty = TileTy(ptr_ty, TupleTy(()))
+        len_ty = TileTy(int32, TupleTy(()))
+        return ptr_tile_ty, len_ty
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        from .ir import ListValue
+        base, length = items
+        return ListValue(base, length)
+
 
 # ============== Pointer Type ===============
 
@@ -363,9 +427,21 @@ class PointerTy(Type):
 # ============== Range Iter Type ===============
 
 
+# FIXME: rename to RangeTy, this is not really an iterator
 class RangeIterType(Type):
     def __init__(self, dtype):
         self.dtype = dtype
+
+    def is_aggregate(self) -> bool:
+        return True
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        return self.dtype, self.dtype, self.dtype
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        from .ir import RangeValue
+        start, stop, step = items
+        return RangeValue(start, stop, step)
 
     def __str__(self):
         return f"Range<{self.dtype}>"
@@ -408,6 +484,17 @@ class FunctionTy(Type):
 class BoundMethodTy(Type):
     self_ty: Type
     func: FunctionType
+
+    def is_aggregate(self) -> bool:
+        return True
+
+    def aggregate_item_types(self) -> tuple["Type", ...]:
+        return (self.self_ty,)
+
+    def make_aggregate_value(self, items: tuple["Var", ...]) -> "AggregateValue":
+        from .ir import BoundMethodValue
+        [bound_self] = items
+        return BoundMethodValue(bound_self)
 
 
 @dataclass(frozen=True)

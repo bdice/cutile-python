@@ -4,10 +4,9 @@
 import enum
 import math
 import operator
-import types
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Optional, Union, Any, List, Callable
+from typing import Sequence, Tuple, Optional, Union, Any, List, Callable, Iterator
 
 from typing_extensions import override
 
@@ -15,15 +14,13 @@ import cuda.tile._stub as ct
 from cuda.tile import _datatype as datatype, TileValueError
 from cuda.tile import RoundingMode, MemoryOrder, MemoryScope
 from cuda.tile._mutex import tile_mutex
-from cuda.tile._exception import (
-    TileTypeError,
-    ConstFoldNotImplementedError, TileSyntaxError,
-)
+from cuda.tile._exception import TileTypeError, TileSyntaxError
 from cuda.tile._ir.ir import (
     Operation, Var, Loc, Block,
-    has_side_effects, terminator, add_operation, TypedOperation, RangeInfo, Builder,
-    has_multiple_results, nested_block, PhiState, LoopVarState,
-    JumpInfo, ControlFlowInfo
+    has_side_effects, terminator, add_operation, TypedOperation, Builder,
+    has_multiple_results, nested_block, PhiState, LoopVarState, JumpInfo, ControlFlowInfo,
+    TupleValue, make_aggregate, RangeValue, BoundMethodValue, ArrayValue, ConstantState,
+    ListValue
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
@@ -51,7 +48,7 @@ from .ops_utils import (
 from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval, get_constant_value
 from .type import (
     TupleTy, TileTy, NoneType, BoundMethodTy, SizeTy, ArrayTy,
-    ListTy, make_tile_ty, SliceType, DTypeConstructor, PointerTy, RangeIterType, Type,
+    ListTy, make_tile_ty, SliceType, DTypeConstructor, RangeIterType, Type,
     NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy, InvalidType
 )
 from cuda.tile._datatype import (
@@ -60,11 +57,12 @@ from cuda.tile._datatype import (
 from cuda.tile._ir2bytecode import (
     lower_reduce,
     lower_reduce_argmax_argmin, lower_scan,
-    unflatten_values, BytecodeContext, typeid_tuple, typeid,
-    generate_bytecode_for_block, convert_dtype, flatten_type, get_list_item_repr_size_in_words,
-    get_list_partition_view_tile_size
+    BytecodeContext, typeid,
+    generate_bytecode_for_block, convert_dtype, get_list_item_repr_size_in_words,
+    get_list_partition_view_tile_size, tensor_view_typeid, tensor_view_typeid_for_list
 )
 import cuda.tile._bytecode as bc
+from .._debug import CUDA_TILE_TESTING_DISABLE_DIV
 
 
 # ================================================
@@ -76,15 +74,18 @@ import cuda.tile._bytecode as bc
 class Loop(TypedOperation):
     def __init__(
         self,
-        iterable: Optional[Var],
+        start: Optional[Var],
+        stop: Optional[Var],
+        step: Optional[Var],
         initial_values: tuple[Var, ...],
         result_vars: tuple[Var, ...],
         body: Block,
         loc: Loc
     ):
+        assert (start is None) == (stop is None) == (step is None)
         super().__init__(
             "loop",
-            operands={"iterable": iterable, "initial_values": initial_values},
+            operands={"start": start, "stop": stop, "step": step, "initial_values": initial_values},
             result_vars=list(result_vars),
             nested_blocks=[body],
             loc=loc,
@@ -95,49 +96,44 @@ class Loop(TypedOperation):
         return self.nested_blocks[0]
 
     @property
+    def is_for_loop(self) -> bool:
+        return self.start is not None
+
+    @property
     def induction_var(self):
-        assert self.iterable is not None
+        assert self.is_for_loop
         return self.nested_blocks[0].params[0]
 
     @property
     def body_vars(self) -> tuple[Var, ...]:
-        return self.body.params if self.iterable is None else self.body.params[1:]
+        return self.body.params[1:] if self.is_for_loop else self.body.params
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value, ...], ...]:
+    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, ...]:
         types = tuple(x.get_type() for x in self.body_vars)
-        initial_values = [
-            val
-            for input_var, ty in zip(self.initial_values, types)
-            for val in ctx.get_value_tuple_allow_undefined(input_var, ty)
-        ]
-        result_type_ids = [type_id
-                           for ty in types
-                           for type_id in typeid_tuple(ctx.type_table, ty)]
+        initial_values = [ctx.get_value_allow_undefined(input_var, ty)
+                          for input_var, ty in zip(self.initial_values, types, strict=True)]
+        result_type_ids = [typeid(ctx.type_table, ty) for ty in types]
 
-        assert len(result_type_ids) == len(initial_values)
-
-        if self.iterable is None:
-            nested_builder = bc.encode_LoopOp(ctx.builder, result_type_ids, initial_values)
-            block_arg_type_ids = result_type_ids
-        else:
-            start, stop, step = ctx.get_value_tuple(self.iterable)
+        if self.is_for_loop:
+            start, stop, step = (ctx.get_value(x) for x in (self.start, self.stop, self.step))
             nested_builder = bc.encode_ForOp(ctx.builder, result_type_ids, start, stop, step,
                                              initial_values)
             induction_var_type_id = ctx.typeid_of(self.induction_var)
             block_arg_type_ids = (induction_var_type_id, *result_type_ids)
+        else:
+            nested_builder = bc.encode_LoopOp(ctx.builder, result_type_ids, initial_values)
+            block_arg_type_ids = result_type_ids
 
         with nested_builder.new_block(block_arg_type_ids) as block_args, ctx.enter_loop(self):
             block_args = iter(block_args)
-            if self.iterable is not None:
-                ctx.set_values(self.induction_var, (next(block_args),),)
-            for var, value_tuple in zip(self.body_vars,
-                                        unflatten_values(block_args, types), strict=True):
-                ctx.set_values(var, value_tuple)
+            if self.is_for_loop:
+                ctx.set_value(self.induction_var, next(block_args))
+            for var, value in zip(self.body_vars, block_args, strict=True):
+                ctx.set_value(var, value)
             generate_bytecode_for_block(ctx, self.body)
 
-        result_values = nested_builder.done()
-        return unflatten_values(iter(result_values), types)
+        return nested_builder.done()
 
     @override
     def _to_string_block_prefixes(self) -> List[str]:
@@ -151,9 +147,10 @@ class Loop(TypedOperation):
                 return var.name
             return f"{var.name}: {ty}"
 
-        if self.iterable is not None:
+        if self.is_for_loop:
             body_vars = self.body.params[1:]
-            header_str = f"for {self.body.params[0].name} in {self.iterable.name}"
+            header_str = (f"for {self.body.params[0].name}"
+                          f" in range({self.start.name}, {self.stop.name}, {self.step.name})")
         else:
             body_vars = self.body.params
             header_str = "loop"
@@ -180,7 +177,9 @@ def loop_impl(body: hir.Block, iterable: Var):
     builder = Builder.get_current()
     local_scope = builder.scope.local
     stored_names = tuple(sorted(body.stored_names))
-    var_states = tuple(LoopVarState(PhiState(), PhiState()) for _ in stored_names)
+    var_states = tuple(LoopVarState(PhiState(initial_constant_state=ConstantState.NONCONSTANT),
+                                    PhiState())
+                       for _ in stored_names)
     initial_values = tuple(local_scope.get(name, builder.loc) for name in stored_names)
 
     # Logic specific to `for` loops:
@@ -198,12 +197,15 @@ def loop_impl(body: hir.Block, iterable: Var):
         # Define body variables. Not all of them will eventually be kept,
         # so we don't set the block parameters yet.
         body_vars = []
-        for name, initial_var, state in zip(stored_names, initial_values, var_states, strict=True):
-            state.body_phi.set_nonconstant()
+        for name, initial_var, state in zip(
+                stored_names, initial_values, var_states, strict=True):
             state.body_phi.propagate(initial_var, allow_loose_typing=False)
             body_var = local_scope.redefine(name, state.body_phi.last_loc)
             body_var.set_type(state.body_phi.ty)
             body_vars.append(body_var)
+
+        flat_body_vars = flatten_block_parameters(body_vars)
+
         # Dispatch the body (hir.Block) to populate the new_body (ir.Block) with Operations
         dispatch_hir_block(body)
 
@@ -219,32 +221,66 @@ def loop_impl(body: hir.Block, iterable: Var):
 
     # Determine the final loop variable types and filter out invalid variables
     mask = []
-    for body_var, state in zip(body_vars, var_states, strict=True):
+    for i, (body_var, state) in enumerate(zip(body_vars, var_states, strict=True)):
+        was_valid = not isinstance(body_var.get_type_allow_invalid(), InvalidType)
         state.finalize_loopvar_type(body_var)
-        is_valid = not isinstance(body_var.get_type_allow_invalid(), InvalidType)
+        ty = body_var.get_type_allow_invalid()
+        is_valid = not isinstance(ty, InvalidType)
         mask.append(is_valid)
         if not is_valid:
             body_var.set_undefined()
+        elif not was_valid and ty.is_aggregate():
+            # The initial variable is invalid but the loop variable is preserved,
+            # and the loop variable is aggregate. In this case, `flat_body_vars[i]`
+            # will contain a single variable (previously of InvalidType,
+            # and now of an aggregate type). Thus, we need to update it with
+            # the according number of flattened undefined variables.
+            assert len(flat_body_vars[i]) == 1
+            undefined_items = expand_aggregate_var(body_var)
+            flat_body_vars[i] = undefined_items
+            # Create a fake aggregate value so that flatten_aggregates() doesn't fail
+            # when we update the Continue/Break statements later.
+            body_var.set_aggregate(TupleValue(undefined_items))
 
     # Set the block's parameters
-    valid_body_vars = tuple(v for v, is_valid in zip(body_vars, mask, strict=True) if is_valid)
-    new_body.params = body.params + valid_body_vars
+    all_flattened_body_vars = sum((flattened for flattened, is_valid
+                                   in zip(flat_body_vars, mask, strict=True) if is_valid), ())
+    new_body.params = body.params + all_flattened_body_vars
+    valid_var_types = tuple(v.get_type() for v, is_valid in zip(body_vars, mask, strict=True)
+                            if is_valid)
 
     # Update Continue/Break statements
     for jump_info in loop_info.jumps:
-        values = tuple(out for out, is_valid in zip(jump_info.outputs, mask, strict=True)
+        values = tuple(out
+                       for out, is_valid in zip(jump_info.outputs, mask, strict=True)
                        if is_valid)
-        jump_info.jump_op.update_operand("values", values)
+        flat_values = flatten_aggregates(values, valid_var_types)
+        assert len(flat_values) == len(all_flattened_body_vars)
+        jump_info.jump_op.update_operand("values", flat_values)
 
     # Create the loop Operation
     valid_initial_values = tuple(v for v, is_valid in zip(initial_values, mask, strict=True)
                                  if is_valid)
+    flat_initial_values = flatten_aggregates(valid_initial_values, valid_var_types)
+    assert len(flat_initial_values) == len(all_flattened_body_vars)
+
+    flat_var_types = flatten_aggregate_types(valid_var_types)
+    if range_ty is None:
+        start = stop = step = None
+    else:
+        range_val = iterable.get_aggregate()
+        assert isinstance(range_val, RangeValue)
+        start, stop, step = range_val.start, range_val.stop, range_val.step
+    flat_result_vars = add_operation(Loop, flat_var_types,
+                                     start=start,
+                                     stop=stop,
+                                     step=step,
+                                     initial_values=flat_initial_values,
+                                     body=new_body)
+
     result_types = tuple(s.result_phi.ty for s, is_valid in zip(var_states, mask, strict=True)
                          if is_valid)
-    result_vars = add_operation(Loop, result_types,
-                                iterable=None if range_ty is None else iterable,
-                                initial_values=valid_initial_values,
-                                body=new_body)
+    result_vars = unflatten_aggregates(flat_result_vars, valid_var_types, result_types)
 
     # Finalize the scope & type information for valid result variables
     valid_var_states = tuple(s for s, is_valid in zip(var_states, mask, strict=True)
@@ -302,19 +338,17 @@ class IfElse(TypedOperation):
         return self.nested_blocks[1]
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value, ...]]:
+    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, ...]:
         cond_val = ctx.get_value(self.cond)
         result_types = tuple(ctx.typeof(v) for v in self.result_vars)
-        result_type_id_tuples = tuple(typeid_tuple(ctx.type_table, t) for t in result_types)
-        result_type_ids = sum(result_type_id_tuples, ())
+        result_type_ids = tuple(typeid(ctx.type_table, t) for t in result_types)
         nested_builder = bc.encode_IfOp(ctx.builder, result_type_ids, cond_val)
 
         for block in (self.then_block, self.else_block):
             with nested_builder.new_block(()):
                 generate_bytecode_for_block(ctx, block)
 
-        results = nested_builder.done()
-        return unflatten_values(iter(results), result_types)
+        return nested_builder.done()
 
     @override
     def _to_string_block_prefixes(self) -> List[str]:
@@ -383,17 +417,20 @@ def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tup
 
     # Determine which results have valid types
     mask = tuple(not isinstance(phi.ty, InvalidType) for phi in result_phis)
+    valid_result_types = tuple(phi.ty for phi, is_valid in zip(result_phis, mask) if is_valid)
 
     # Update the EndBranch operations by setting the outputs
     for jump_info in info.jumps:
         outputs = tuple(v for v, is_valid in zip(jump_info.outputs, mask, strict=True)
                         if is_valid)
-        jump_info.jump_op.update_operand("outputs", outputs)
+        flat_outputs = flatten_aggregates(outputs, valid_result_types)
+        jump_info.jump_op.update_operand("outputs", flat_outputs)
 
     # Generate an IfElse op
-    valid_result_types = tuple(phi.ty for phi, is_valid in zip(result_phis, mask) if is_valid)
-    valid_results = add_operation(IfElse, valid_result_types,
-                                  cond=cond, then_block=new_then_block, else_block=new_else_block)
+    flat_types = flatten_aggregate_types(valid_result_types)
+    flat_results = add_operation(IfElse, flat_types,
+                                 cond=cond, then_block=new_then_block, else_block=new_else_block)
+    valid_results = unflatten_aggregates(flat_results, valid_result_types, valid_result_types)
 
     # Finalize the constant/loose type information
     valid_result_phis = tuple(phi for phi, is_valid in zip(result_phis, mask) if is_valid)
@@ -435,9 +472,9 @@ class Continue(TypedOperation):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
-        next_values = [value
-                       for var, body_var in zip(self.values, ctx.innermost_loop.body_vars)
-                       for value in ctx.get_value_tuple_allow_undefined(var, ctx.typeof(body_var))]
+        next_values = [ctx.get_value_allow_undefined(var, ctx.typeof(body_var))
+                       for var, body_var
+                       in zip(self.values, ctx.innermost_loop.body_vars, strict=True)]
         bc.encode_ContinueOp(ctx.builder, next_values)
         return ()
 
@@ -473,10 +510,9 @@ class Break(TypedOperation):
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
         # body_vars is not a typo. We use body variables because they always contain the actual
         # types of the loop variables, whereas result variables may have an InvalidType.
-        output_values = [value
-                         for var, body_var in zip(self.values, ctx.innermost_loop.body_vars)
-                         for value in ctx.get_value_tuple_allow_undefined(var,
-                                                                          ctx.typeof(body_var))]
+        output_values = [ctx.get_value_allow_undefined(var, ctx.typeof(body_var))
+                         for var, body_var
+                         in zip(self.values, ctx.innermost_loop.body_vars, strict=True)]
         bc.encode_BreakOp(ctx.builder, output_values)
         return ()
 
@@ -512,9 +548,7 @@ class EndBranch(TypedOperation):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
-        output_values = [value
-                         for var in self.outputs
-                         for value in ctx.get_value_tuple(var)]
+        output_values = tuple(ctx.get_value(var) for var in self.outputs)
         bc.encode_YieldOp(ctx.builder, output_values)
         return ()
 
@@ -575,14 +609,8 @@ class TypedConst(TypedOperation):
                          attributes={"value": value}, loc=loc)
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> list[tuple[bc.Value, ...]]:
-        try:
-            return [ctx.constant_tuple(self.value, ctx.typeof(self.result_var))]
-        except ConstFoldNotImplementedError:
-            # FIXME: this is a workaround. Ideally, we should remove these Const ops
-            #        with DCE. But this will only be possible when we move parameters
-            #        like `order` (which is a string) from operands to attributes.
-            return [()]
+    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
+        return ctx.constant(self.value, ctx.typeof(self.result_var))
 
 
 def loosely_typed_const(value: Any,
@@ -1084,108 +1112,29 @@ def slice_impl(start: Var, stop: Var, step: Var) -> Var:
         slice(start.get_constant(), stop.get_constant(), step.get_constant()))
 
 
-class TupleItemOperation(TypedOperation):
-    def __init__(self, x: Var, index: int, result_var: Var, loc: Loc):
-        super().__init__("tuple_item",
-                         operands={"x": x},
-                         attributes={"index": index},
-                         result_vars=[result_var],
-                         loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext):
-        tuple_ty = ctx.typeof(self.x)
-        flat_index = 0
-        for item_ty in tuple_ty.value_types[:self.index]:
-            flat_index += len(flatten_type(item_ty))
-        items = ctx.get_value_tuple(self.x)
-        item_len = len(flatten_type(tuple_ty.value_types[self.index]))
-        return [tuple(items[flat_index:flat_index + item_len])]
-
-
-def tuple_item(x: Var, index: int) -> Var:
-    tuple_ty = require_tuple_type(x)
+def tuple_item(tup: TupleValue, index: int) -> Var:
+    assert isinstance(tup, TupleValue)
     try:
-        item_ty = tuple_ty[index]
+        return tup.items[index]
     except IndexError:
-        raise TileTypeError(f"Index {index} is out of range for a tuple of length {len(tuple_ty)}")
-
-    loose_tuple_ty = x.get_loose_type()
-    assert isinstance(loose_tuple_ty, TupleTy) and len(loose_tuple_ty) == len(tuple_ty)
-    loose_item_ty = loose_tuple_ty[index]
-
-    if index < 0:
-        index += len(tuple_ty)
-
-    if x.is_constant():
-        item_const = x.get_constant()[index]
-        return loosely_typed_const(item_const)
-
-    if isinstance(loose_item_ty, LooselyTypedScalar):
-        return loosely_typed_const(loose_item_ty.value)
-
-    res = add_operation(TupleItemOperation, item_ty, x=x, index=index)
-    res.set_loose_type(loose_item_ty)
-    return res
+        raise TileTypeError(
+                f"Index {index} is out of range for a tuple of length {len(tup.items)}")
 
 
-class TupleSliceOperation(TypedOperation):
-    def __init__(self, x: Var, slc: slice, result_var: Var, loc: Loc):
-        super().__init__("tuple_slice",
-                         operands={"x": x},
-                         attributes={"slc": slc},
-                         result_vars=[result_var],
-                         loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext):
-        tuple_ty = ctx.typeof(self.x)
-        flat_index = 0
-        flat_indices = []
-        for item_ty in tuple_ty.value_types:
-            item_len = len(flatten_type(item_ty))
-            flat_indices.append(slice(flat_index, flat_index + item_len))
-            flat_index += item_len
-
-        items = ctx.get_value_tuple(self.x)
-        ret_items = []
-        for sub_slice in flat_indices[self.slc]:
-            ret_items.extend(items[sub_slice])
-
-        return [tuple(ret_items)]
-
-
-def tuple_slice(x: Var, slc: slice) -> Var:
-    assert isinstance(slc, slice)
-    tuple_ty = require_tuple_type(x)
-    item_types = tuple_ty.value_types[slc]
-    subtuple_ty = TupleTy(item_types)
-
-    loose_tuple_ty = x.get_loose_type()
-    assert isinstance(loose_tuple_ty, TupleTy) and len(loose_tuple_ty) == len(tuple_ty)
-    loose_item_types = loose_tuple_ty.value_types[slc]
-    loose_subtuple_ty = TupleTy(loose_item_types)
-
-    if x.is_constant():
-        subtuple_constant = tuple(x.get_constant()[slc])
-        return loosely_typed_const(subtuple_constant, subtuple_ty, loose_subtuple_ty)
-
-    if all(isinstance(item_ty, LooselyTypedScalar) for item_ty in loose_subtuple_ty):
-        subtuple_constant = tuple(item_ty.value for item_ty in loose_subtuple_ty)
-        return loosely_typed_const(subtuple_constant, subtuple_ty, loose_subtuple_ty)
-
-    ret = add_operation(TupleSliceOperation, subtuple_ty, x=x, slc=slc)
-    ret.set_loose_type(loose_subtuple_ty)
-    return ret
+def tuple_slice(tup: TupleValue, slc: slice) -> Var:
+    assert isinstance(tup, TupleValue)
+    items = tup.items[slc]
+    return build_tuple(items)
 
 
 def tuple_getitem(x: Var, key: Var) -> Var:
+    tuple_val = x.get_aggregate()
     key_ty = key.get_type()
     if isinstance(key_ty, SliceType):
         slc = require_constant_slice(key)
-        return tuple_slice(x, slc)
+        return tuple_slice(tuple_val, slc)
     idx = require_constant_int(key)
-    return tuple_item(x, idx)
+    return tuple_item(tuple_val, idx)
 
 
 def tile_expand_dims(x: Var, index: Tuple[Any, ...]) -> Var:
@@ -1232,11 +1181,11 @@ def tile_getitem(x: Var, key: Var) -> Var:
                             "use `extract()` or `item()` instead.")
 
 
-class ListItemOperation(TypedOperation):
-    def __init__(self, x: Var, index: Var, result_var: Var, loc: Loc):
-        super().__init__("list_item",
+class GetArrayListItem(TypedOperation):
+    def __init__(self, x: Var, index: Var, result_vars: list[Var], loc: Loc):
+        super().__init__("get_array_list_item",
                          operands={"x": x, "index": index},
-                         result_vars=[result_var],
+                         result_vars=result_vars,
                          loc=loc)
 
     @override
@@ -1245,7 +1194,7 @@ class ListItemOperation(TypedOperation):
         assert isinstance(list_ty, ListTy)
 
         # First, load a (1 x item_tile_size) tile that represents the item
-        partition_view = ctx.get_list_partition_view(self.x)
+        partition_view = ctx.get_value(self.x)
         item_size = get_list_item_repr_size_in_words(list_ty.item_type)
         item_tile_size = get_list_partition_view_tile_size(item_size)
         pv_tile_type_id = ctx.type_table.tile(ctx.type_table.I64, (1, item_tile_size))
@@ -1266,43 +1215,49 @@ class ListItemOperation(TypedOperation):
             optimization_hints=None
         )
 
-        item_typeid_tuple = typeid_tuple(ctx.type_table, list_ty.item_type)
+        item_typeid_tuple = tuple(typeid(ctx.type_table, ty)
+                                  for ty in list_ty.item_type.flatten_aggregate())
 
         # Next, unpack the tile into individual values that represent the item
-        if isinstance(list_ty.item_type, ArrayTy):
-            assert len(item_typeid_tuple) == item_size
+        assert isinstance(list_ty.item_type, ArrayTy)
+        assert len(item_typeid_tuple) == item_size
 
-            # Extract and reshape each element of the (1 x item_tile_size) tile
-            # as a separate i64 scalar
-            i64_scalar_ty = ctx.type_table.tile(ctx.type_table.I64, ())
-            i64_1x1_ty = ctx.type_table.tile(ctx.type_table.I64, (1, 1))
-            extracted_words = tuple(
-                bc.encode_ReshapeOp(
-                    ctx.builder,
-                    i64_scalar_ty,
-                    bc.encode_ExtractOp(ctx.builder, i64_1x1_ty, loaded_tile,
-                                        (zero_i32, ctx.constant(i, datatype.int32)),),
-                )
-                for i in range(item_size)
+        # Extract and reshape each element of the (1 x item_tile_size) tile
+        # as a separate i64 scalar
+        i64_scalar_ty = ctx.type_table.tile(ctx.type_table.I64, ())
+        i64_1x1_ty = ctx.type_table.tile(ctx.type_table.I64, (1, 1))
+        extracted_words = tuple(
+            bc.encode_ReshapeOp(
+                ctx.builder,
+                i64_scalar_ty,
+                bc.encode_ExtractOp(ctx.builder, i64_1x1_ty, loaded_tile,
+                                    (zero_i32, ctx.constant(i, datatype.int32)),),
             )
+            for i in range(item_size)
+        )
 
-            # Cast each of the i64 words to appropriate types
-            return [(
-                # Cast the first word to data pointer
-                bc.encode_IntToPtrOp(ctx.builder, item_typeid_tuple[0], extracted_words[0]),
-                # Cast the remaining words to i32 shape/strides
-                *(bc.encode_TruncIOp(ctx.builder, ty, w, bc.IntegerOverflow.NONE)
-                  for ty, w in zip(item_typeid_tuple[1:], extracted_words[1:], strict=True))
-            )]
-        else:
-            raise NotImplementedError(f"Indexing a list of {list_ty.item_type} is not implemented")
+        # Cast each of the i64 words to appropriate types
+        return (
+            # Cast the first word to data pointer
+            bc.encode_IntToPtrOp(ctx.builder, item_typeid_tuple[0], extracted_words[0]),
+            # Cast the remaining words to i32 shape/strides
+            *(bc.encode_TruncIOp(ctx.builder, ty, w, bc.IntegerOverflow.NONE)
+              for ty, w in zip(item_typeid_tuple[1:], extracted_words[1:], strict=True))
+        )
 
 
 def list_item(x: Var, index: Var) -> Var:
     list_ty = require_list_type(x)
     require_integer_dtype(index)
     item_ty = list_ty.item_type
-    return add_operation(ListItemOperation, item_ty, x=x, index=index)
+
+    if not isinstance(item_ty, ArrayTy):
+        raise TileTypeError(f"Indexing a list of {list_ty.item_type} is not implemented")
+
+    flat_types = tuple(item_ty.flatten_aggregate())
+    flat_results = add_operation(GetArrayListItem, flat_types, x=x, index=index)
+    [ret] = unflatten_aggregates(flat_results, (item_ty,), (item_ty,))
+    return ret
 
 
 @impl(operator.getitem)
@@ -1315,47 +1270,25 @@ def getitem(object: Var, key: Var) -> Var:
     raise TileTypeError(f'Indexing an object of type {object_ty} is not supported')
 
 
-class ListLen(TypedOperation):
-    def __init__(self, x: Var, result_var: Var, loc: Loc):
-        super().__init__("list_len", operands={"x": x}, result_vars=[result_var], loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
-        return ctx.get_value_tuple(self.x)[1]
-
-
 @impl(len)
 def len_impl(x: Var) -> Var:
     x_type = x.get_type()
     if isinstance(x_type, TupleTy):
         return loosely_typed_const(len(x_type))
     require_list_type(x)
-    return add_operation(ListLen, datatype.int32, x=x)
-
-
-class BuildTuple(TypedOperation):
-    def __init__(self, items: tuple[Var, ...], result_var: Var, loc: Loc):
-        super().__init__("build_tuple",
-                         operands={"items": items},
-                         result_vars=[result_var],
-                         loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext):
-        return [sum((ctx.get_value_tuple(x) for x in self.items), ())]
+    list_val = x.get_aggregate()
+    assert isinstance(list_val, ListValue)
+    return list_val.length
 
 
 @impl(hir.build_tuple)
 def build_tuple(items: tuple[Var, ...]) -> Var:
     ty = TupleTy(tuple(x.get_type() for x in items))
     loose_ty = TupleTy(tuple(x.get_loose_type() for x in items))
-
+    res = make_aggregate(TupleValue(items), ty, loose_ty)
     if all(x.is_constant() for x in items):
-        return loosely_typed_const(tuple(x.get_constant() for x in items), ty=ty, loose_ty=loose_ty)
-
-    ret = add_operation(BuildTuple, ty, items=items)
-    ret.set_loose_type(loose_ty)
-    return ret
+        res.set_constant(tuple(x.get_constant() for x in items))
+    return res
 
 
 class Unary(TypedOperation):
@@ -1550,8 +1483,8 @@ def getattr_impl(object: Var, name: Var) -> Var:
     match ty, attr_name:
         case ArrayTy(), "dtype": return loosely_typed_const(ty.dtype)
         case ArrayTy(), "ndim": return loosely_typed_const(ty.ndim)
-        case ArrayTy(), "shape": return get_array_shape(object)
-        case ArrayTy(), "strides": return get_array_strides(object)
+        case ArrayTy(), "shape": return build_tuple(object.get_aggregate().shape)
+        case ArrayTy(), "strides": return build_tuple(object.get_aggregate().strides)
 
         case TileTy(), "dtype": return loosely_typed_const(ty.dtype)
         case TileTy(), "shape": return loosely_typed_const(ty.shape_value)
@@ -1581,88 +1514,10 @@ def getattr_impl(object: Var, name: Var) -> Var:
     raise TileTypeError(f"No such attribute '{attr_name}' for object of type {ty}")
 
 
-class GetArrayBasePtr(TypedOperation):
-    def __init__(self, array: Var, result_var: Var, loc: Loc):
-        super().__init__("get_array_base_ptr", operands={"array": array},
-                         result_vars=[result_var], loc=loc)
-
-    def generate_bytecode(self, ctx: "BytecodeContext"):
-        arr_tuple = ctx.get_value_tuple(self.array)
-        return arr_tuple[0]
-
-
-def get_array_base_ptr(array: Var) -> Var:
-    array_ty = require_array_type(array)
-    res_ty = PointerTy(array_ty.dtype)
-    return add_operation(GetArrayBasePtr, res_ty, array=array)
-
-
-class GetArrayShape(TypedOperation):
-    def __init__(self, value: Var, result_var: Var, loc: Loc):
-        super().__init__("get_array_shape", operands={"value": value},
-                         result_vars=[result_var], loc=loc)
-
-    def generate_bytecode(self, ctx: BytecodeContext):
-        ndim = ctx.typeof(self.value).ndim
-        arr_tuple = ctx.get_value_tuple(self.value)
-        return [arr_tuple[1:1 + ndim]]
-
-
-def get_array_shape(array: Var) -> Var:
-    array_ty = require_array_type(array)
-    shape_ty = TupleTy((datatype.default_int_type,) * array_ty.ndim)
-    loose_shape_ty = TupleTy(tuple(datatype.default_int_type
-                                   if sz.maybe_value is None else LooselyTypedScalar(sz.value)
-                                   for sz in array_ty.shape))
-    ret = add_operation(GetArrayShape, shape_ty, value=array)
-    ret.set_loose_type(loose_shape_ty)
-    return ret
-
-
-class GetArrayStrides(TypedOperation):
-    def __init__(self, array: Var, result_var: Var, loc: Loc):
-        super().__init__("get_array_strides", operands={"array": array},
-                         result_vars=[result_var], loc=loc)
-
-    def generate_bytecode(self, ctx: BytecodeContext):
-        ndim = ctx.typeof(self.array).ndim
-        arr_tuple = ctx.get_value_tuple(self.array)
-        return [arr_tuple[1 + ndim:]]
-
-
-def get_array_strides(array: Var) -> Var:
-    array_ty = require_array_type(array)
-    res_ty = TupleTy((datatype.default_int_type,) * array_ty.ndim)
-    return add_operation(GetArrayStrides, res_ty, array=array)
-
-
-class BindMethod(TypedOperation):
-    def __init__(self, object: Var, func: types.FunctionType, result_var: Var, loc: Loc):
-        super().__init__("bind_method", operands={"object": object},
-                         attributes={"func": func}, result_vars=[result_var], loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext):
-        return [ctx.get_value_tuple(self.object)]
-
-
 def bind_method(object: Var, func) -> Var:
+    agg_value = BoundMethodValue(object)
     res_ty = BoundMethodTy(object.get_type(), func)
-    return add_operation(BindMethod, res_ty, object=object, func=func)
-
-
-class GetBoundSelf(TypedOperation):
-    def __init__(self, bound_method: Var, result_var: Var, loc: Loc):
-        super().__init__("get_bound_self", operands={"bound_method": bound_method},
-                         result_vars=[result_var], loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext):
-        return [ctx.get_value_tuple(self.bound_method)]
-
-
-def get_bound_self(bound_method: Var) -> Var:
-    return add_operation(GetBoundSelf, bound_method.get_type().self_ty, bound_method=bound_method)
+    return make_aggregate(agg_value, res_ty)
 
 
 class Assign(TypedOperation):
@@ -1672,8 +1527,10 @@ class Assign(TypedOperation):
         )
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> list[tuple[bc.Value, ...]]:
-        return [ctx.get_value_tuple(self.value)]
+    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
+        # FIXME: Ideally, all Assign ops should be eliminated before the bytecode generation stage.
+        #        But keep this for now just in case.
+        return ctx.get_value(self.value)
 
     @override
     def _to_string_rhs(self) -> str:
@@ -1693,22 +1550,6 @@ def identity_impl(x: Var) -> Var:
         return loosely_typed_const(x.get_constant(), x.get_type(), x.get_loose_type())
     else:
         return x
-
-
-class Range(TypedOperation):
-    def __init__(self, start: Var, stop: Var, step: Var, result_var: Var, loc: Loc):
-        super().__init__("range",
-                         operands={"start": start, "stop": stop, "step": step},
-                         result_vars=[result_var],
-                         loc=loc)
-        if step.is_constant():
-            result_var.set_range_info(RangeInfo(known_step=step.get_constant()))
-
-    @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value, ...]]:
-        start, stop, step = (ctx.get_value_tuple(v)
-                             for v in (self.start, self.stop, self.step))
-        return (start + stop + step),
 
 
 @impl(range)
@@ -1736,24 +1577,9 @@ def range_(args: Tuple[Var, ...]) -> Var:
         if step.is_constant() and step.get_constant() <= 0:
             raise TileTypeError(f"Step must be positive, got {step.get_constant()}")
 
-    return add_operation(
-        Range,
-        RangeIterType(datatype.default_int_type),
-        start=start, stop=stop, step=step)
-
-
-class UnpackRange(Operation):
-    def __init__(self, range_object: Var, result_vars: Tuple[Var, Var, Var], loc: Loc):
-        assert len(result_vars) == 3
-        super().__init__("unpack_range",
-                         operands={"range_object": range_object},
-                         result_vars=list(result_vars),
-                         loc=loc)
-
-    @override
-    def generate_bytecode(self, ctx: "BytecodeContext"):
-        start, stop, step = ctx.get_value_tuple(self.range_object)
-        return (start,), (stop,), (step,)
+    agg_value = RangeValue(start, stop, step)
+    ty = RangeIterType(datatype.default_int_type)
+    return make_aggregate(agg_value, ty)
 
 
 def _register_dtype_constructors(f):
@@ -1825,6 +1651,215 @@ def bid_impl(axis: Var) -> Var:
     return bid(axis)
 
 
+class MakeTensorView(TypedOperation):
+    def __init__(self, base_ptr: Var, shape: tuple[Var, ...], dynamic_strides: tuple[Var, ...],
+                 result_var: Var, loc: Loc):
+        super().__init__(
+            "make_tensor_view",
+            operands={"base_ptr": base_ptr, "shape": shape, "dynamic_strides": dynamic_strides},
+            result_vars=[result_var],
+            loc=loc
+        )
+
+    @override
+    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
+        array_ty: ArrayTy = self.result_var.get_type()
+        view_type_id = tensor_view_typeid(ctx.type_table, array_ty)
+        base_ptr = ctx.get_value(self.base_ptr)
+        shape = tuple(ctx.get_value(x) for x in self.shape)
+        dynamic_strides = tuple(ctx.get_value(x) for x in self.dynamic_strides)
+        return bc.encode_MakeTensorViewOp(ctx.builder,
+                                          result_type=view_type_id,
+                                          base=base_ptr,
+                                          dynamicShape=shape,
+                                          dynamicStrides=dynamic_strides)
+
+
+class AssumeDivBy(TypedOperation):
+    def __init__(self, x: Var, divisor: int, result_var: Var, loc: Loc):
+        super().__init__(
+            "assume_div_by",
+            operands={"x": x},
+            attributes={"divisor": divisor},
+            result_vars=[result_var],
+            loc=loc
+        )
+
+    @override
+    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
+        x = ctx.get_value(self.x)
+        type_id = ctx.typeid_of(self.result_var)
+        return bc.encode_AssumeOp(ctx.builder, type_id, x, bc.DivBy(self.divisor))
+
+
+def assume_div_by(x: Var, divisor: int | None) -> Var:
+    if divisor is None or divisor == 1 or CUDA_TILE_TESTING_DISABLE_DIV:
+        return x
+    return add_operation(AssumeDivBy, x.get_type(), x=x, divisor=divisor)
+
+
+class AssumeBounded(TypedOperation):
+    def __init__(self, x: Var, lower_bound: int | None, upper_bound: int | None,
+                 result_var: Var, loc: Loc):
+        super().__init__(
+            "assume_bounded",
+            operands={"x": x},
+            attributes={"lower_bound": lower_bound, "upper_bound": upper_bound},
+            result_vars=[result_var],
+            loc=loc
+        )
+
+    @override
+    def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
+        x = ctx.get_value(self.x)
+        type_id = ctx.typeid_of(self.result_var)
+        pred = bc.Bounded(lb=self.lower_bound, ub=self.upper_bound)
+        return bc.encode_AssumeOp(ctx.builder, type_id, x, pred)
+
+
+def assume_bounded(x: Var, lower_bound: int | None, upper_bound: int | None) -> Var:
+    return add_operation(AssumeBounded, x.get_type(), x=x,
+                         lower_bound=lower_bound, upper_bound=upper_bound)
+
+
+class MakeListView(TypedOperation):
+    def __init__(self, base_ptr: Var, length: Var, result_var: Var, loc: Loc):
+        super().__init__(
+            "make_list_view",
+            operands={"base_ptr": base_ptr, "length": length},
+            result_vars=[result_var],
+            loc=loc
+        )
+
+    def generate_bytecode(self, ctx: "BytecodeContext"):
+        ty = self.result_var.get_type()
+        assert isinstance(ty, ListTy)
+        item_size = get_list_item_repr_size_in_words(ty.item_type)
+        tv_ty = tensor_view_typeid_for_list(ctx.type_table, item_size)
+        pv_tile_shape = 1, get_list_partition_view_tile_size(item_size)
+        # On padding value:
+        # We intentionally choose to have padding_value Missing, such that
+        # reading a list out of bound results in undefined memref
+        # A safer choice is to have zero padding, which result in a zero shaped
+        # memref which cannot be written to, but we do not want user to rely
+        # on the consequence of this specific implementation.
+        # Another alternative is to use a different encoding the shape/stride
+        # such that zero padding will end up being FFFFF once read back. This way
+        # out of bound access of list[array] will result in a memref at 0x0 with 0xFFFF
+        # shape and stride, such that when there is accidental write to it, guarantees
+        # illegal memory access.
+        pv_ty = ctx.type_table.partition_view(pv_tile_shape, tv_ty, [0, 1],
+                                              bc.PaddingValue.Missing)
+        ptr = ctx.get_value(self.base_ptr)
+        length = ctx.get_value(self.length)
+        tv = bc.encode_MakeTensorViewOp(ctx.builder, tv_ty, ptr, [length], [])
+        return bc.encode_MakePartitionViewOp(ctx.builder, pv_ty, tv)
+
+
+def flatten_aggregates(vars: Sequence[Var], types: Sequence[Type]) -> tuple[Var, ...]:
+    ret = []
+    for x, ty in zip(vars, types, strict=True):
+        item_types = tuple(ty.flatten_aggregate())
+        if isinstance(x.get_type_allow_invalid(), InvalidType):
+            ret.extend(x.ctx.make_temp(x.loc, undefined=True) for _ in item_types)
+        else:
+            items = tuple(x.flatten_aggregate())
+            assert len(items) == len(item_types)
+            ret.extend(items)
+    return tuple(ret)
+
+
+def flatten_aggregate_types(types: Sequence[Type]) -> tuple[Type, ...]:
+    ret = []
+    for ty in types:
+        ret.extend(ty.flatten_aggregate())
+    return tuple(ret)
+
+
+def unflatten_aggregates(flattened: Tuple[Var, ...],
+                         nominal: Sequence[Type], actual: Sequence[Type]) -> tuple[Var, ...]:
+    it = iter(flattened)
+    ret = tuple(_maybe_unflatten_aggregate(it, n, a) for n, a in zip(nominal, actual, strict=True))
+    assert next(it, None) is None
+    return ret
+
+
+def _maybe_unflatten_aggregate(flattened_iter: Iterator[Var], nominal: Type, actual: Type) -> Var:
+    if not nominal.is_aggregate():
+        return next(flattened_iter)
+    return _unflatten_proper_aggregate(flattened_iter, nominal, actual, result_var=None)
+
+
+def expand_aggregate_var(var: Var) -> Tuple[Var, ...]:
+    item_types = tuple(var.get_type().flatten_aggregate())
+    ret = tuple(var.ctx.make_var(f"{var.get_original_name()}_{i}", var.loc)
+                for i in range(len(item_types)))
+    for item, item_ty in zip(ret, item_types, strict=True):
+        item.set_type(item_ty)
+    return ret
+
+
+def flatten_block_parameters(vars: Sequence[Var]) -> list[tuple[Var, ...]]:
+    ret = []
+    for v in vars:
+        ty = v.get_type_allow_invalid()
+        if ty.is_aggregate():
+            flattened_vars = expand_aggregate_var(v)
+            ret.append(flattened_vars)
+            it = iter(flattened_vars)
+            _unflatten_proper_aggregate(it, ty, ty, v)
+            assert next(it, None) is None
+        else:
+            ret.append((v,))
+    return ret
+
+
+def _unflatten_proper_aggregate(flattened_iter: Iterator[Var], nominal: Type, actual: Type,
+                                result_var: Var | None) -> Var:
+    nominal_item_types = nominal.aggregate_item_types()
+    if isinstance(actual, InvalidType):
+        # Pop values from the iterator and throw them out
+        for _ in nominal_item_types:
+            next(flattened_iter)
+        # Return an undefined variable. It is OK that we don't create an aggregate value for it --
+        # any use of it should be invalid anyway.
+        builder = Builder.get_current()
+        return builder.ir_crx.make_temp(builder.loc, undefined=True)
+
+    items = tuple(_maybe_unflatten_aggregate(flattened_iter, item_nominal, item_actual)
+                  for item_nominal, item_actual
+                  in zip(nominal_item_types, actual.aggregate_item_types(), strict=True))
+    val = nominal.make_aggregate_value(items)
+
+    builder = Builder.get_current()
+    if isinstance(nominal, ArrayTy):
+        assert isinstance(val, ArrayValue)
+        base_ptr = assume_div_by(val.base_ptr, nominal.base_ptr_div_by)
+        shape = tuple(assume_div_by(assume_bounded(x, 0, None), divisor)
+                      for x, divisor in zip(val.shape, nominal.shape_div_by, strict=True))
+
+        all_strides = []
+        dynamic_strides = []
+        for x, s, divisor in zip(val.strides, nominal.strides, nominal.stride_div_by, strict=True):
+            if s.maybe_value is None:
+                x = assume_div_by(assume_bounded(x, 0, None), divisor)
+                dynamic_strides.append(x)
+            all_strides.append(x)
+
+        operands = dict(base_ptr=base_ptr, shape=shape, dynamic_strides=tuple(dynamic_strides))
+        ret = builder.add_operation(MakeTensorView, nominal, operands, result_var)
+        ret.set_aggregate(ArrayValue(base_ptr, shape, tuple(all_strides)))
+        return ret
+    elif isinstance(nominal, ListTy):
+        assert isinstance(val, ListValue)
+        operands = dict(base_ptr=val.base_ptr, length=val.length)
+        ret = builder.add_operation(MakeListView, nominal, operands, result_var)
+        ret.set_aggregate(val)
+        return ret
+    else:
+        return builder.make_aggregate(val, nominal, result_var=result_var)
+
+
 class TileNumBlocks(TypedOperation):
     def __init__(self, axis: int, result_var: Var, loc: Loc):
         super().__init__(
@@ -1851,7 +1886,7 @@ def num_blocks(axis: Var) -> Var:
 
 class TileLoad(TypedOperation):
     def __init__(
-        self, array: Var, index: Var, order: Sequence[int],
+        self, array: Var, index: tuple[Var, ...], order: Sequence[int],
         padding_mode: PaddingMode, latency: Optional[int], allow_tma: Optional[bool],
         result_var: Var, loc: Loc
     ):
@@ -1866,11 +1901,11 @@ class TileLoad(TypedOperation):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
-        (res,), _ = tile_load_generate_bytecode(self, ctx)
+        res, _ = tile_load_generate_bytecode(self, ctx)
         return res
 
 
-def tile_load(array: Var, index: Var, shape: Sequence[int], order: Sequence[int],
+def tile_load(array: Var, index: tuple[Var, ...], shape: Sequence[int], order: Sequence[int],
               padding_mode: PaddingMode, latency: Optional[int], allow_tma: Optional[bool]) -> Var:
     res_ty = make_tile_ty(array.get_type().dtype, shape)
     return add_operation(TileLoad, res_ty,
@@ -1883,9 +1918,11 @@ def tile_load_impl(array: Var, index: Var, shape: Var, order: Var,
                    padding_mode: Var, latency: Var, allow_tma: Var) -> Var:
     array_ty = require_array_type(array)
     index_ty = require_index_or_index_tuple_type(index)
-    index_len = len(index_ty) if isinstance(index_ty, TupleTy) else 1
-    if array_ty.ndim != index_len:
-        raise TileTypeError(f"Index size {index_len} does not match the array rank {array_ty.ndim}")
+    index_items = index.get_aggregate().items if isinstance(index_ty, TupleTy) else (index,)
+
+    if array_ty.ndim != len(index_items):
+        raise TileTypeError(f"Index size {len(index_items)}"
+                            f" does not match the array rank {array_ty.ndim}")
 
     shape = require_constant_shape(shape, allow_single_int=True, expected_rank=array_ty.ndim,
                                    allow_0d_shape=True)
@@ -1895,7 +1932,8 @@ def tile_load_impl(array: Var, index: Var, shape: Var, order: Var,
     latency = require_optional_constant_int(latency)
     allow_tma = require_optional_constant_bool(allow_tma)
     check_load_store_hints(latency, allow_tma)
-    result = tile_load(array, index, broadcasted_shape, order, padding_mode, latency, allow_tma)
+    result = tile_load(array, index_items, broadcasted_shape, order, padding_mode, latency,
+                       allow_tma)
     return reshape(result, shape)
 
 
@@ -1917,13 +1955,13 @@ class TileLoadTokenOrdered(TypedOperation):
         )
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value], tuple[bc.Value]]:
+    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, bc.Value]:
         return tile_load_generate_bytecode(self, ctx)
 
 
 @has_side_effects
 class TileStore(TypedOperation):
-    def __init__(self, array: Var, index: Var, tile: Var, order: Sequence[int],
+    def __init__(self, array: Var, index: tuple[Var, ...], tile: Var, order: Sequence[int],
                  latency: Optional[int], allow_tma: Optional[bool], loc: Loc):
         super().__init__(
             "tile_store",
@@ -1939,7 +1977,7 @@ class TileStore(TypedOperation):
         return ()
 
 
-def tile_store(array: Var, index: Var, tile: Var, order: Sequence[int],
+def tile_store(array: Var, index: tuple[Var, ...], tile: Var, order: Sequence[int],
                latency: Optional[int], allow_tma: Optional[bool]):
     array_ty = array.get_type()
     ty = require_tile_or_scalar_type(tile)
@@ -1966,9 +2004,10 @@ def tile_store_impl(array: Var, index: Var, tile: Var, order: Var,
                     latency: Var, allow_tma: Var):
     array_ty = require_array_type(array)
     index_ty = require_index_or_index_tuple_type(index)
-    index_len = len(index_ty) if isinstance(index_ty, TupleTy) else 1
-    if array_ty.ndim != index_len:
-        raise TileTypeError(f"Index size {index_len} does not match the array rank {array_ty.ndim}")
+    index_items = index.get_aggregate().items if isinstance(index_ty, TupleTy) else (index,)
+    if array_ty.ndim != len(index_items):
+        raise TileTypeError(f"Index size {len(index_items)}"
+                            f" does not match the array rank {array_ty.ndim}")
 
     tile = _implicit_cast(tile, array_ty.dtype, "Stored tile is incompatible with array's dtype")
 
@@ -1977,7 +2016,7 @@ def tile_store_impl(array: Var, index: Var, tile: Var, order: Var,
     allow_tma = require_optional_constant_bool(allow_tma)
     check_load_store_hints(latency, allow_tma)
 
-    tile_store(array, index, tile, order, latency, allow_tma)
+    tile_store(array, index_items, tile, order, latency, allow_tma)
 
 
 @has_side_effects
@@ -2043,9 +2082,8 @@ class LoadPointerTokenOrdered(Operation):
         )
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[tuple[bc.Value], tuple[bc.Value]]:
-        lowered_res, lowered_tok = load_pointer_lowering(self, ctx)
-        return (lowered_res,), (lowered_tok,)
+    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, bc.Value]:
+        return load_pointer_lowering(self, ctx)
 
 
 def load_pointer(pointer: Var, mask: Optional[Var], padding_value: Optional[Var],
@@ -2238,13 +2276,13 @@ def _gather_scatter_pointer_and_mask(array: Var,
                                 f" are not broadcastable to a common shape")
 
     # Calculate offset from indices (and the mask, if check_bounds is True)
-    array_shape = get_array_shape(array)
-    array_stride = get_array_strides(array)
+    array_val = array.get_aggregate()
+    assert isinstance(array_val, ArrayValue)
     offset = None
     mask = None
     for dim in range(len(index_types)):
         if isinstance(indices_ty, TupleTy):
-            ind = tuple_item(indices, dim)
+            ind = tuple_item(indices.get_aggregate(), dim)
         else:
             ind = indices
 
@@ -2252,7 +2290,7 @@ def _gather_scatter_pointer_and_mask(array: Var,
         ind = broadcast_to(ind, common_shape)
 
         if check_bounds:
-            array_size = tuple_item(array_shape, dim)
+            array_size = array_val.shape[dim]
             array_size = astype(array_size, datatype.uint64)
             dim_mask = comparison("lt", ind, array_size)
             if mask is None:
@@ -2265,7 +2303,7 @@ def _gather_scatter_pointer_and_mask(array: Var,
             offset_delta = ind
         else:
             if static_stride is None:
-                stride = astype(tuple_item(array_stride, dim), datatype.uint64)
+                stride = astype(array_val.strides[dim], datatype.uint64)
             else:
                 stride = loosely_typed_const(static_stride)
             offset_delta = binary_arithmetic("mul", ind, stride)
@@ -2276,12 +2314,11 @@ def _gather_scatter_pointer_and_mask(array: Var,
             offset = binary_arithmetic("add", offset, offset_delta)
 
     # Offset the base pointer
-    base_ptr = get_array_base_ptr(array)
     if offset is None:
         # 0-D array case
-        return base_ptr, None
+        return array_val.base_ptr, None
     else:
-        pointer = pointer_offset(base_ptr, offset)
+        pointer = pointer_offset(array_val.base_ptr, offset)
         return pointer, mask
 
 
@@ -2319,8 +2356,7 @@ class TileAtomicCASTokenOrdered(TypedOperation):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
-        val, token = _atomic_cas_generate_bytecode(self, ctx)
-        return (val,), (token,)
+        return _atomic_cas_generate_bytecode(self, ctx)
 
 
 def _atomic_cas_generate_bytecode(op: Union[TileAtomicCAS, TileAtomicCASTokenOrdered],
@@ -2411,8 +2447,7 @@ class TileAtomicRMWTokenOrdered(TypedOperation):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
-        res, tok = _atomic_rmw_generate_bytecode(self, ctx)
-        return (res,), (tok,)
+        return _atomic_rmw_generate_bytecode(self, ctx)
 
 
 def _atomic_rmw_generate_bytecode(op: Union[TileAtomicRMW, TileAtomicRMWTokenOrdered],
@@ -2930,10 +2965,10 @@ def expand_dims_impl(x: Var, axis: Var) -> Var:
 
 
 class TileCat(TypedOperation):
-    def __init__(self, tiles: Var, axis: int, result_var: Var, loc: Loc):
+    def __init__(self, x: Var, y: Var, axis: int, result_var: Var, loc: Loc):
         super().__init__(
             "tile_cat",
-            operands={"tiles": tiles},
+            operands={"x": x, "y": y},
             attributes={"axis": axis},
             result_vars=[result_var],
             loc=loc
@@ -2942,16 +2977,25 @@ class TileCat(TypedOperation):
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
         return_type_id = ctx.typeid_of(self.result_var)
-        x_value, y_value = ctx.get_value_tuple(self.tiles)
+        x_value, y_value = ctx.get_value(self.x), ctx.get_value(self.y)
         return bc.encode_CatOp(ctx.builder, return_type_id, x_value, y_value, self.axis)
 
 
 def cat(tiles: Var, axis: int) -> Var:
     tuple_ty = require_tuple_type(tiles)
+    items = tiles.get_aggregate().items
+    if len(items) == 1:
+        return items[0]
+
     if len(tuple_ty) == 0:
         raise TileTypeError("cat() received an empty tuple")
+    elif len(items) == 1:
+        return items[0]
     elif len(tuple_ty) > 2:
         raise TileTypeError(f"cat() supports at most 2 tiles, got {len(tuple_ty)}")
+
+    x_tile, y_tile = items
+
     if not isinstance(first_tile := tuple_ty.value_types[0], TileTy):
         raise TileTypeError(f"Expected tuple of Tile, got a {first_tile}")
 
@@ -2976,10 +3020,8 @@ def cat(tiles: Var, axis: int) -> Var:
     if not all(_is_power_of_2(x) for x in shape_value):
         raise TileTypeError(f"Result tile shape must be power of 2, got: {shape_value}")
 
-    if len(tuple_ty) == 1:
-        return tuple_item(tiles, 0)
     res_ty = make_tile_ty(dtype, shape_value)
-    return add_operation(TileCat, res_ty, tiles=tiles, axis=axis)
+    return add_operation(TileCat, res_ty, x=x_tile, y=y_tile, axis=axis)
 
 
 def _is_power_of_2(x: int):
@@ -3369,7 +3411,7 @@ def transpose_impl(x: Var, axis0: Var, axis1: Var) -> Var:
 
 
 class TileExtract(TypedOperation):
-    def __init__(self, x: Var, index: Var, shape: Sequence[int],
+    def __init__(self, x: Var, index: tuple[Var, ...], shape: Sequence[int],
                  result_var: Var, loc: Loc):
         super().__init__(
             "tile_extract",
@@ -3381,12 +3423,12 @@ class TileExtract(TypedOperation):
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
         x_value = ctx.get_value(self.x)
-        index = ctx.get_value_tuple(self.index)
+        index = tuple(ctx.get_value(idx) for idx in self.index)
         res_type_id = ctx.typeid_of(self.result_var)
         return bc.encode_ExtractOp(ctx.builder, res_type_id, x_value, index)
 
 
-def extract(x: Var, index: Var, shape: Sequence[int]) -> Var:
+def extract(x: Var, index: tuple[Var, ...], shape: Sequence[int]) -> Var:
     dtype = get_dtype(x.get_type())
     res_ty = make_tile_ty(dtype, shape)
     return add_operation(TileExtract, res_ty, x=x, index=index, shape=shape)
@@ -3402,9 +3444,10 @@ def extract_impl(x: Var, index: Var, shape: Var) -> Var:
         shape = (1,) * x_ty.ndim
 
     index_ty = require_index_or_index_tuple_type(index)
-    index_len = len(index_ty) if isinstance(index_ty, TupleTy) else 1
-    if x_ty.ndim != index_len:
-        raise TileTypeError(f"Index size {index_len} does not match the tile rank {x_ty.ndim}")
+    index_items = index.get_aggregate().items if isinstance(index_ty, TupleTy) else (index,)
+    if x_ty.ndim != len(index_items):
+        raise TileTypeError(f"Index size {len(index_items)}"
+                            f" does not match the tile rank {x_ty.ndim}")
 
     for i, (s1, s2) in enumerate(zip(x_ty.shape_value, shape, strict=True)):
         if s2 == 0:
@@ -3412,7 +3455,7 @@ def extract_impl(x: Var, index: Var, shape: Var) -> Var:
         if s1 % s2 != 0:
             raise TileTypeError(f"Input shape {x_ty.shape_value} is not divisible by"
                                 f" result shape {shape} at dimension #{i}")
-    result = extract(x, index, shape)
+    result = extract(x, index_items, shape)
     return reshape(result, orig_shape)
 
 

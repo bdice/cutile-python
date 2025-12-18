@@ -12,10 +12,10 @@ from .ast2hir import get_function_hir
 from .. import TileTypeError
 from .._exception import Loc, TileSyntaxError, TileInternalError, TileError, TileRecursionError
 from .._ir import hir, ir
-from .._ir.ir import Var, IRContext, Argument, Scope, LocalScope
+from .._ir.ir import Var, IRContext, Argument, Scope, LocalScope, BoundMethodValue
 from .._ir.op_impl import op_implementations, impl
-from .._ir.ops import loosely_typed_const, get_bound_self, assign, end_branch, return_, continue_, \
-    break_
+from .._ir.ops import loosely_typed_const, assign, end_branch, return_, continue_, \
+    break_, flatten_block_parameters
 from .._ir.type import FunctionTy, BoundMethodTy, DTypeConstructor
 from .._ir.typing_support import get_signature
 
@@ -27,17 +27,18 @@ def hir2ir(func_hir: hir.Function,
            args: tuple[Argument, ...],
            ir_ctx: IRContext) -> ir.Block:
     scope = _create_scope(func_hir, ir_ctx, call_site=None)
-    ir_params = tuple(scope.local.redefine(name, loc)
-                      for name, loc in zip(func_hir.param_names, func_hir.param_locs, strict=True))
+    aggregate_params = [
+        scope.local.redefine(param_name, param_loc)
+        for param_name, param_loc in zip(func_hir.param_names, func_hir.param_locs, strict=True)
+    ]
     preamble = []
-    for var, param_name, param_loc, arg in zip(ir_params, func_hir.param_names, func_hir.param_locs,
-                                               args, strict=True):
-        if arg.is_const:
-            preamble.append(hir.Call((), hir.store_var, (param_name, arg.const_value), (),
-                                     param_loc))
+    for param_name, var, arg in zip(func_hir.param_names, aggregate_params, args, strict=True):
         var.set_type(arg.type)
+        if arg.is_const:
+            preamble.append(hir.Call((), hir.store_var, (param_name, arg.const_value), (), var.loc))
 
     with ir.Builder(ir_ctx, func_hir.body.loc, scope) as ir_builder:
+        flat_params = flatten_block_parameters(aggregate_params)
         try:
             _dispatch_hir_block_inner(preamble, func_hir.body, ir_builder)
         except Exception as e:
@@ -48,7 +49,8 @@ def hir2ir(func_hir: hir.Function,
                 print(f"==== Partial cuTile IR ====\n\n{ir_str}\n\n", file=sys.stderr)
             raise
 
-    ret = ir.Block(ir_ctx, ir_params, func_hir.body.name, func_hir.body.loc)
+    all_flat_params = sum(flat_params, ())
+    ret = ir.Block(ir_ctx, all_flat_params, func_hir.body.name, func_hir.body.loc)
     ret.extend(ir_builder.ops)
     return ret
 
@@ -243,7 +245,9 @@ def _get_callee_and_self(callee_var: Var) -> tuple[Any, tuple[()] | tuple[Var]]:
     if isinstance(callee_ty, FunctionTy):
         return callee_ty.func, ()
     elif isinstance(callee_ty, BoundMethodTy):
-        return callee_ty.func, (get_bound_self(callee_var),)
+        bound_method = callee_var.get_aggregate()
+        assert isinstance(bound_method, BoundMethodValue)
+        return callee_ty.func, (bound_method.bound_self,)
     elif isinstance(callee_ty, DTypeConstructor):
         return callee_ty.dtype, ()
     else:

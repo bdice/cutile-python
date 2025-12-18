@@ -5,22 +5,20 @@
 import functools
 import os
 from contextlib import contextmanager
-from typing import Dict, Tuple, Sequence, Any, List, Optional, Iterator, Set
+from typing import Dict, Tuple, Sequence, Any, Optional
 
 from cuda.tile import _datatype as datatype
 from cuda.tile._datatype import get_signedness
 from cuda.tile import DType, RoundingMode, PaddingMode
 import cuda.tile._bytecode as bc
 from cuda.tile._compiler_options import CompilerOptions
-from cuda.tile._debug import CUDA_TILE_TESTING_DISABLE_DIV
-from cuda.tile._exception import TileInternalError, TileError, ConstFoldNotImplementedError, \
-    FunctionDesc
+from cuda.tile._exception import TileInternalError, TileError, FunctionDesc
 from cuda.tile._ir.ir import Block, Loc, Var, IRContext
 from cuda.tile._ir.ops_utils import (
     padding_mode_to_bytecode, rounding_mode_to_bytecode,
     get_default_rounding_mode, get_dtype,
 )
-from cuda.tile._ir.type import Type, TileTy, PointerTy, TokenTy, TupleTy, ArrayTy, ListTy, SizeTy
+from cuda.tile._ir.type import Type, TileTy, PointerTy, TokenTy, TupleTy, ArrayTy, SizeTy
 
 
 def dtype_typeid(tt: bc.TypeTable, dtype: datatype.DType) -> bc.TypeId:
@@ -57,32 +55,6 @@ def typeid(tt: bc.TypeTable, ty: Type, wrap_scalars: bool = True) -> bc.TypeId:
         raise NotImplementedError(f"Lowering type '{ty}' is not supported")
 
 
-def array_size_type() -> Type:
-    return TileTy(datatype.int32, TupleTy(()))
-
-
-def flatten_type(ty: Type) -> Tuple[Type, ...]:
-    if isinstance(ty, TupleTy):
-        return sum((flatten_type(x) for x in ty.value_types), ())
-    elif isinstance(ty, ArrayTy):
-        ptr_type = PointerTy(ty.dtype)
-        ptr_tile_ty = TileTy(ptr_type, TupleTy(()))
-        size_ty = array_size_type()
-        # Base pointer, shape, strides
-        return (ptr_tile_ty,) + (size_ty,) * (ty.ndim * 2)
-    elif isinstance(ty, ListTy):
-        ptr_ty = PointerTy(datatype.int64)
-        ptr_tile_ty = TileTy(ptr_ty, TupleTy(()))
-        len_ty = TileTy(datatype.int32, TupleTy(()))
-        return ptr_tile_ty, len_ty
-    else:
-        return ty,
-
-
-def typeid_tuple(tt: bc.TypeTable, ty: Type) -> Tuple[bc.TypeId, ...]:
-    return tuple(typeid(tt, x) for x in flatten_type(ty))
-
-
 def get_list_item_repr_size_in_words(item_ty: Type) -> int:
     if isinstance(item_ty, ArrayTy):
         # Base pointer + shape + strides
@@ -94,13 +66,6 @@ def get_list_item_repr_size_in_words(item_ty: Type) -> int:
 def get_list_partition_view_tile_size(item_size_words: int) -> int:
     # Round up the item size to the nearest power of two
     return 1 << (item_size_words - 1).bit_length()
-
-
-def unflatten_values(flattened: Iterator[bc.Value],
-                     types: Tuple[Type, ...]) -> Tuple[Tuple[bc.Value, ...], ...]:
-    ret = tuple(tuple(next(flattened) for _ in flatten_type(ty)) for ty in types)
-    assert next(flattened, None) is None
-    return ret
 
 
 # Encode a single int/float value according to the MLIR "DenseElementsAttr" splat format.
@@ -518,11 +483,9 @@ class BytecodeContext:
         self.global_section = global_section
         self._typemap: Dict[str, Type] = ir_ctx.typemap
         self._constants: Dict[str, Any] = ir_ctx.constants
-        self._value_map: Dict[str, Tuple[bc.Value, ...]] = {}
+        self._value_map: Dict[str, bc.Value] = {}
         self._array_base_ptr: Dict[str, bc.Value] = {}
-        self._array_tensor_views: Dict[str, bc.Value] = {}
         self._list_partition_views: Dict[str, bc.Value] = {}
-        self._assumed_value_ids: Set[int] = set()
         self.sm_arch = sm_arch
         self.innermost_loop = None
 
@@ -557,18 +520,10 @@ class BytecodeContext:
         return self._constants.get(var.name, default)
 
     def get_value(self, var: Var) -> bc.Value:
-        only_value, = self.get_value_tuple(var)
-        return only_value
-
-    def get_value_tuple(self, var: Var) -> Tuple[bc.Value, ...]:
         return self._value_map[var.name]
 
-    def get_value_tuple_allow_undefined(self, var: Var,
-                                        ty: Type) -> Tuple[bc.Value, ...]:
-        if var.is_undefined():
-            return tuple(self.undefined_value(t) for t in flatten_type(ty))
-        else:
-            return self.get_value_tuple(var)
+    def get_value_allow_undefined(self, var: Var, ty: Type) -> bc.Value:
+        return self.undefined_value(ty) if var.is_undefined() else self.get_value(var)
 
     def get_optional_value(self, var: Var) -> Optional[bc.Value]:
         if var.name in self._constants and self._constants[var.name] is None:
@@ -576,146 +531,11 @@ class BytecodeContext:
         else:
             return self.get_value(var)
 
-    def set_values(self, var: Var, values: Sequence[bc.Value]) -> None:
+    def set_value(self, var: Var, value: bc.Value) -> None:
         name = var.name
         if name in self._value_map:
             raise ValueError(f"Variable {name} is already in the value map")
-
-        ty = self._typemap[name]
-        if isinstance(ty, ArrayTy):
-            with self.loc(var.loc):
-                values = self._make_assumed_values(ty, values)
-
-        values = tuple(values)
-        assert all(isinstance(x, bc.Value) for x in values)
-        self._value_map[name] = values
-
-        if isinstance(ty, ArrayTy):
-            with self.loc(var.loc):
-                base_ptr = values[0]
-                self._array_base_ptr[name] = base_ptr
-                self._array_tensor_views[name] = self._make_array_tensor_view(ty, values, base_ptr)
-        elif isinstance(ty, ListTy):
-            with self.loc(var.loc):
-                self._list_partition_views[name] = self._make_list_partition_view(ty, *values)
-
-    def _make_assumed_values(
-        self, ty: ArrayTy, vals: Sequence[bc.Value]
-    ) -> Tuple[bc.Value, ...]:
-        # ArrayTy has base pointer, shape and strides.
-        # Add assume to base pointer: div_by
-        base_ptr = self._make_assumed_base_ptr(ty, vals[0])
-        # Add assume to shape: bounded and div_by
-        shape = self._make_assumed_shape(ty, vals[1:1 + ty.ndim])
-        # Add assume to strides: bounded and div_by
-        strides = self._make_assumed_strides(ty, vals[1 + ty.ndim: 1 + 2 * ty.ndim])
-        return (base_ptr, *shape, *strides)
-
-    def _make_assume(self, ty, val: bc.Value, predicate: bc.attribute.AssumePredicate) -> bc.Value:
-        if val.value_id in self._assumed_value_ids:
-            return val
-        assumed_val = bc.encode_AssumeOp(self.builder, ty, val, predicate)
-        return assumed_val
-
-    def _make_assumed_base_ptr(self, ty: ArrayTy, ptr: bc.Value) -> bc.Value:
-        if ty.base_ptr_div_by is None:
-            return ptr
-        ptr_ty = typeid_tuple(self.type_table, ty)[0]
-        assumed_ptr = self._make_assume(ptr_ty, ptr, bc.DivBy(ty.base_ptr_div_by))
-        self._assumed_value_ids.add(assumed_ptr.value_id)
-        return assumed_ptr
-
-    def _make_assumed_shape(
-        self, ty: ArrayTy, shape: Sequence[bc.Value]
-    ) -> List[bc.Value]:
-        # Add bound assume to shape.
-        size_ty = typeid(self.type_table, array_size_type())
-        shape = [self._make_assume(size_ty, val, bc.Bounded(lb=0, ub=None)) for val in shape]
-
-        # Add div_by assume to shape.
-        if CUDA_TILE_TESTING_DISABLE_DIV:
-            return shape
-        assumed_shape = [
-            val if div_by is None
-            else self._make_assume(size_ty, val, bc.DivBy(div_by))
-            for val, div_by in zip(shape, ty.shape_div_by)
-        ]
-
-        self._assumed_value_ids.update(v.value_id for v in assumed_shape)
-        return assumed_shape
-
-    def _make_assumed_strides(
-        self, ty: ArrayTy, strides: Sequence[bc.Value]
-    ) -> List[bc.Value]:
-        # Add bound assume to strides.
-        stride_ty = typeid(self.type_table, array_size_type())
-        strides = [self._make_assume(stride_ty, val, bc.Bounded(lb=0, ub=None)) for val in strides]
-
-        # Add div_by assume to strides.
-        if CUDA_TILE_TESTING_DISABLE_DIV:
-            return strides
-        assumed_strides = [
-            val if div_by is None
-            else self._make_assume(stride_ty, val, bc.DivBy(div_by))
-            for val, div_by in zip(strides, ty.stride_div_by)
-        ]
-
-        self._assumed_value_ids.update(v.value_id for v in assumed_strides)
-        return assumed_strides
-
-    def _make_array_tensor_view(self,
-                                ty: ArrayTy,
-                                vals: Sequence[bc.Value],
-                                base_ptr: bc.Value) -> bc.Value:
-        shape = vals[1:1 + ty.ndim]
-        strides = vals[1 + ty.ndim: 1 + 2 * ty.ndim]
-        view_ty_id = tensor_view_typeid(self.type_table, ty)
-        dynamic_strides = self._get_dynamic_strides(ty, strides)
-        return bc.encode_MakeTensorViewOp(self.builder,
-                                          result_type=view_ty_id,
-                                          base=base_ptr,
-                                          dynamicShape=shape,
-                                          dynamicStrides=dynamic_strides)
-
-    def _get_dynamic_strides(self,
-                             array_ty: ArrayTy,
-                             strides: Sequence[bc.Value]) -> List[bc.Value]:
-        return [
-            val for val, s in zip(strides, array_ty.strides) if s.maybe_value is None
-        ]
-
-    def _make_list_partition_view(self,
-                                  ty: ListTy,
-                                  ptr: bc.Value,
-                                  length: bc.Value) -> bc.Value:
-        item_size = get_list_item_repr_size_in_words(ty.item_type)
-        tv_ty = tensor_view_typeid_for_list(self.type_table, item_size)
-        pv_tile_shape = 1, get_list_partition_view_tile_size(item_size)
-        # On padding value:
-        # We intentionally choose to have padding_value Missing, such that
-        # reading a list out of bound results in undefined memref
-        # A safer choice is to have zero padding, which result in a zero shaped
-        # memref which cannot be written to, but we do not want user to rely
-        # on the consequence of this specific implementation.
-        # Another alternative is to use a different encoding the shape/stride
-        # such that zero padding will end up being FFFFF once read back. This way
-        # out of bound access of list[array] will result in a memref at 0x0 with 0xFFFF
-        # shape and stride, such that when there is accidental write to it, guarantees
-        # illegal memory access.
-        pv_ty = self.type_table.partition_view(pv_tile_shape, tv_ty, [0, 1],
-                                               bc.PaddingValue.Missing)
-
-        tv = bc.encode_MakeTensorViewOp(self.builder, tv_ty, ptr, [length], [])
-        return bc.encode_MakePartitionViewOp(self.builder, pv_ty, tv)
-
-    def get_array_base_pointer(self, array: Var) -> bc.Value:
-        return self._array_base_ptr[array.name]
-
-    def get_array_tensor_view(self, array: Var) -> bc.Value:
-        return self._array_tensor_views[array.name]
-
-    def get_list_partition_view(self, lst: Var) -> bc.Value:
-        return self._list_partition_views[lst.name]
+        self._value_map[name] = value
 
     def cast(self, val: bc.Value, fromty: Type, toty: Type) -> bc.Value:
         if fromty == toty:
@@ -743,28 +563,13 @@ class BytecodeContext:
             value = bc.encode_BitcastOp(self.builder, typeid(self.type_table, toty), value)
         return value
 
-    def add_pointer(self,
-                    ptr: bc.Value, pointee_dtype: datatype.DType,
-                    offset: bc.Value, offset_type: Type) -> bc.Value:
-        offset_shape = (() if isinstance(offset_type, datatype.DType)
-                        else tuple(x.value for x in offset_type.shape))
-        tt = self.type_table
-        new_ptr_shape = [1] * len(offset_shape)
-        ptr_typeid = tt.pointer(tt.simple(pointee_dtype._bytecode_type))
-        reshaped_ptr_typeid = tt.tile(ptr_typeid, new_ptr_shape)
-        ptr = bc.encode_ReshapeOp(self.builder, reshaped_ptr_typeid, ptr)
-        broadcasted_ptr_typeid = tt.tile(ptr_typeid, offset_shape)
-        ptr = bc.encode_BroadcastOp(self.builder, broadcasted_ptr_typeid, ptr)
-        return bc.encode_OffsetOp(self.builder, broadcasted_ptr_typeid, ptr, offset)
-
     def constant(self, value: int | float, ty: Type) -> bc.Value:
         if isinstance(ty, TileTy):
             dtype = ty.dtype
         elif isinstance(ty, datatype.DType):
             dtype = ty
         else:
-            # FIXME: raise a plain TypeError once we don't need to catch this
-            raise ConstFoldNotImplementedError(f"Cannot make a constant tuple out of {ty}")
+            raise TypeError(f"Cannot make a constant tuple out of {ty}")
 
         data = _constant_to_bytes(value, dtype)
         return bc.encode_ConstantOp(self.builder, typeid(self.type_table, ty), data)
@@ -796,7 +601,7 @@ class BytecodeContext:
         view_ty_id = tensor_view_typeid(self.type_table, array_ty)
         partition_ty_id = self.type_table.partition_view(
                 tile_shape, view_ty_id, order, padding_value)
-        view = self.get_array_tensor_view(array)
+        view = self.get_value(array)
         return bc.encode_MakePartitionViewOp(self.builder, partition_ty_id, view)
 
 
@@ -806,11 +611,11 @@ def generate_bytecode_for_block(ctx: BytecodeContext, block: Block):
             try:
                 result_values = op.generate_bytecode(ctx)
                 if isinstance(result_values, bc.Value):
-                    result_values = (result_values,),
+                    result_values = (result_values,)
 
-                for result_var, val_tuple in zip(op.result_vars, result_values, strict=True):
-                    assert isinstance(val_tuple, tuple)
-                    ctx.set_values(result_var, val_tuple)
+                for result_var, val in zip(op.result_vars, result_values, strict=True):
+                    assert isinstance(val, bc.Value)
+                    ctx.set_value(result_var, val)
             except TileError:
                 raise
             except Exception as e:
@@ -826,14 +631,7 @@ def generate_bytecode_for_kernel(root_block: Block,
     entry_hints = bc.EntryHints(num_cta_in_cga=target_options.num_ctas,
                                 occupancy=target_options.occupancy)
 
-    param_type_ids = []
-    param_offsets = []
-    for param in root_block.params:
-        param_offsets.append(len(param_type_ids))
-        ty = param.get_type()
-        param_type_ids.extend(typeid_tuple(writer.type_table, ty))
-    param_offsets.append(len(param_type_ids))
-
+    param_type_ids = [typeid(writer.type_table, p.get_type()) for p in root_block.params]
     debug_attr_map = DebugAttrMap(writer.debug_attr_table, root_block.name, anonymize_debug_attr)
     func_debug_attr = debug_attr_map.get_debugattr(root_block.loc)
 
@@ -850,9 +648,7 @@ def generate_bytecode_for_kernel(root_block: Block,
                               ir_ctx=root_block.ctx,
                               sm_arch=sm_arch)
 
-        for var, start, end in zip(root_block.params, param_offsets[:-1], param_offsets[1:],
-                                   strict=True):
-            values = list(param_values[start:end])
-            ctx.set_values(var, values)
+        for var, value in zip(root_block.params, param_values, strict=True):
+            ctx.set_value(var, value)
 
         generate_bytecode_for_block(ctx, root_block)

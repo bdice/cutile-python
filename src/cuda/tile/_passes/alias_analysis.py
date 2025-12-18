@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from typing import FrozenSet, Dict
 
 from cuda.tile._ir.ir import Var, Block
-from cuda.tile._ir.ops import Assign, ListItemOperation, \
-    Loop, IfElse, Continue, Break, EndBranch, PointerOffset, GetArrayBasePtr, ScalarToTile, \
-    TileBroadcast, TileReshape
+from cuda.tile._ir.ops import Assign, GetArrayListItem, \
+    Loop, IfElse, Continue, Break, EndBranch, PointerOffset, ScalarToTile, \
+    TileBroadcast, TileReshape, MakeTensorView, MakeListView, AssumeDivBy
 
 
 class AliasUniverseClass:
@@ -98,18 +98,25 @@ def _analyze_aliases_in_block(block: Block,
     for op in block.operations:
         if isinstance(op, Assign):
             _propagate(alias_tracker, op.value, op.result_var)
-        elif isinstance(op, ListItemOperation):
+        elif isinstance(op, AssumeDivBy):
             _propagate(alias_tracker, op.x, op.result_var)
+        elif isinstance(op, GetArrayListItem):
             # TODO: more granular array list get item alias analysis
+            # Propagate to the base pointer of the array
+            _propagate(alias_tracker, op.x, op.result_vars[0])
+            for v in op.result_vars[1:]:
+                alias_tracker[v.name] = ALIAS_UNIVERSE
+        elif isinstance(op, MakeTensorView):
+            _propagate(alias_tracker, op.base_ptr, op.result_var)
+        elif isinstance(op, MakeListView):
+            _propagate(alias_tracker, op.base_ptr, op.result_var)
         elif isinstance(op, PointerOffset):
             _propagate(alias_tracker, op.pointer, op.result_var)
-        elif isinstance(op, GetArrayBasePtr):
-            _propagate(alias_tracker, op.array, op.result_var)
         elif isinstance(op, ScalarToTile | TileBroadcast | TileReshape):
             # Needed for tiles of pointers produced by gather/scatter
             _propagate(alias_tracker, op.x, op.result_var)
         elif isinstance(op, Loop):
-            if op.iterable is not None:
+            if op.is_for_loop:
                 alias_tracker[op.induction_var.name] = ALIAS_UNIVERSE
 
             for init, body, result in zip(op.initial_values, op.body_vars, op.result_vars,
@@ -119,7 +126,7 @@ def _analyze_aliases_in_block(block: Block,
 
                 # `For` loop initial values can flow into result values if
                 # loop runs for 0 iteration.
-                if op.iterable is not None:
+                if op.is_for_loop:
                     _propagate(alias_tracker, init, result)
 
             _analyze_aliases_in_block(op.body, alias_tracker, op, None)
@@ -132,7 +139,7 @@ def _analyze_aliases_in_block(block: Block,
 
                 # `For` loop next values can flow into result values when
                 # the iterator is exhausted.
-                if innermost_loop.iterable is not None:
+                if innermost_loop.is_for_loop:
                     _propagate(alias_tracker, next, result)
 
         elif isinstance(op, Break):

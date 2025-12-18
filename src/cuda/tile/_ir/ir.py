@@ -28,11 +28,6 @@ if TYPE_CHECKING:
     from cuda.tile._ir2bytecode import BytecodeContext
 
 
-@dataclass
-class RangeInfo:
-    known_step: int
-
-
 class IRContext:
     def __init__(self, tile_ctx: TileContext):
         self._all_vars: Dict[str, str] = {}
@@ -41,8 +36,8 @@ class IRContext:
         self.typemap: Dict[str, Type] = dict()
         self.constants: Dict[str, Any] = dict()
         self._loose_typemap: Dict[str, Type] = dict()
-        self.range_infos: Dict[str, RangeInfo] = dict()
         self.tile_ctx: TileContext = tile_ctx
+        self._aggregate_values: Dict[str, Any] = dict()
 
     #  Make a Var with a unique name based on `name`.
     def make_var(self, name: str, loc: Loc, undefined: bool = False) -> Var:
@@ -68,8 +63,8 @@ class IRContext:
             self._loose_typemap[dst.name] = self._loose_typemap[src.name]
         if src.name in self.constants:
             self.constants[dst.name] = self.constants[src.name]
-        if src.name in self.range_infos:
-            self.range_infos[dst.name] = self.range_infos[src.name]
+        if src.name in self._aggregate_values:
+            self._aggregate_values[dst.name] = self._aggregate_values[src.name]
 
 
 class ConstantState(enum.Enum):
@@ -82,26 +77,15 @@ class ConstantState(enum.Enum):
 class PhiState:
     ty: Type | None = None
     loose_ty: Type | None = None
-    last_loc: Loc | None = None
-    constant_state: ConstantState = ConstantState.UNSET
-    constant_value: Any = None
+    last_loc: Loc = Loc.unknown()
+    initial_constant_state: ConstantState = ConstantState.UNSET
 
-    def set_nonconstant(self):
-        self.constant_state = ConstantState.NONCONSTANT
+    # Constant propagation state, per aggregate item.
+    # We initialize it to None because we don't know yet how many items we have.
+    constant_state: list[ConstantState] | None = None
+    constant_value: list[Any] | None = None
 
     def propagate(self, src: Var, fail_eagerly: bool = False, allow_loose_typing: bool = True):
-        # Constant propagation
-        if src.is_constant():
-            new_const = src.get_constant()
-            if self.constant_state == ConstantState.UNSET:
-                self.constant_state = ConstantState.MAY_BE_CONSTANT
-                self.constant_value = new_const
-            elif (self.constant_state == ConstantState.MAY_BE_CONSTANT
-                  and new_const != self.constant_value):
-                self.constant_state = ConstantState.NONCONSTANT
-        else:
-            self.set_nonconstant()
-
         # Type & loose type propagation
         src_ty = src.get_type_allow_invalid()
         src_loose_ty = src.get_loose_type_allow_invalid() if allow_loose_typing else src_ty
@@ -128,10 +112,44 @@ class PhiState:
             if self.loose_ty != src_loose_ty:
                 self.loose_ty = self.ty
 
+        # Constant propagation
+        if isinstance(src_ty, InvalidType):
+            self.constant_state = None
+            self.initial_constant_state = ConstantState.NONCONSTANT
+        else:
+            agg_items = tuple(src.flatten_aggregate())
+            if self.constant_state is None:
+                self.constant_state = [self.initial_constant_state for _ in range(len(agg_items))]
+                self.constant_value = [None for _ in range(len(agg_items))]
+            else:
+                # This should be true because we already checked the type.
+                # If the type matches, it must have the same aggregate length.
+                assert len(self.constant_state) == len(agg_items)
+
+            for i, item in enumerate(agg_items):
+                if item.is_constant():
+                    new_const = item.get_constant()
+                    if self.constant_state[i] == ConstantState.UNSET:
+                        self.constant_state[i] = ConstantState.MAY_BE_CONSTANT
+                        self.constant_value[i] = new_const
+                    elif (self.constant_state[i] == ConstantState.MAY_BE_CONSTANT
+                          and new_const != self.constant_value[i]):
+                        self.constant_state[i] = ConstantState.NONCONSTANT
+                else:
+                    self.constant_state[i] = ConstantState.NONCONSTANT
+
     def finalize_constant_and_loose_type(self, dst: Var):
-        if self.constant_state == ConstantState.MAY_BE_CONSTANT:
-            dst.set_constant(self.constant_value)
+        assert self.constant_state is not None
+        for item, state, val in zip(dst.flatten_aggregate(),
+                                    self.constant_state, self.constant_value, strict=True):
+            if state == ConstantState.MAY_BE_CONSTANT:
+                item.set_constant(val)
         dst.set_loose_type(self.loose_ty)
+
+
+class AggregateValue:
+    def as_tuple(self) -> tuple["Var", ...]:
+        raise NotImplementedError()
 
 
 class Var:
@@ -192,16 +210,6 @@ class Var:
             assert self.name not in self.ctx._loose_typemap
         self.ctx._loose_typemap[self.name] = ty
 
-    def has_range_info(self) -> bool:
-        return self.name in self.ctx.range_infos
-
-    def get_range_info(self) -> RangeInfo:
-        return self.ctx.range_infos[self.name]
-
-    def set_range_info(self, range_info: RangeInfo):
-        assert self.name not in self.ctx.range_infos
-        self.ctx.range_infos[self.name] = range_info
-
     def is_undefined(self) -> bool:
         return self._undefined
 
@@ -211,6 +219,22 @@ class Var:
     def get_original_name(self) -> str:
         return self.ctx.get_original_name(self.name)
 
+    def is_aggregate(self) -> bool:
+        return self.name in self.ctx._aggregate_values
+
+    def get_aggregate(self) -> AggregateValue:
+        return self.ctx._aggregate_values[self.name]
+
+    def set_aggregate(self, agg_value: AggregateValue):
+        self.ctx._aggregate_values[self.name] = agg_value
+
+    def flatten_aggregate(self) -> Iterator["Var"]:
+        if self.is_aggregate():
+            for x in self.get_aggregate().as_tuple():
+                yield from x.flatten_aggregate()
+        else:
+            yield self
+
     def __repr__(self):
         return f"Var<{self.name} @{self.loc}>"
 
@@ -218,7 +242,49 @@ class Var:
         return self.name
 
 
-TypeResult = list[Type] | Type
+@dataclass
+class TupleValue(AggregateValue):
+    items: tuple[Var, ...]
+
+    def as_tuple(self) -> tuple["Var", ...]:
+        return self.items
+
+
+@dataclass
+class RangeValue(AggregateValue):
+    start: Var
+    stop: Var
+    step: Var
+
+    def as_tuple(self) -> tuple[Var, ...]:
+        return self.start, self.stop, self.step
+
+
+@dataclass
+class BoundMethodValue(AggregateValue):
+    bound_self: Var
+
+    def as_tuple(self) -> tuple[Var, ...]:
+        return (self.bound_self,)
+
+
+@dataclass
+class ArrayValue(AggregateValue):
+    base_ptr: Var
+    shape: tuple[Var, ...]
+    strides: tuple[Var, ...]
+
+    def as_tuple(self) -> tuple[Var, ...]:
+        return self.base_ptr, *self.shape, *self.strides
+
+
+@dataclass
+class ListValue(AggregateValue):
+    base_ptr: Var
+    length: Var
+
+    def as_tuple(self) -> tuple[Var, ...]:
+        return self.base_ptr, self.length
 
 
 def terminator(cls):
@@ -268,7 +334,13 @@ class Mapper:
 def add_operation(op_class,
                   result_ty: Type | None | Tuple[Type | None, ...],
                   **attrs_and_operands) -> Var | Tuple[Var, ...]:
-    return Builder.get_current().add_operation(op_class, result_ty, **attrs_and_operands)
+    return Builder.get_current().add_operation(op_class, result_ty, attrs_and_operands)
+
+
+def make_aggregate(value: AggregateValue,
+                   ty: Type | None,
+                   loose_ty: Type | None = None):
+    return Builder.get_current().make_aggregate(value, ty, loose_ty)
 
 
 @dataclass
@@ -427,26 +499,55 @@ class Builder:
 
     def add_operation(self, op_class,
                       result_ty: Type | None | Tuple[Type | None, ...],
-                      **attrs_and_operands) -> Var | Tuple[Var, ...]:
+                      attrs_and_operands,
+                      result: Var | Sequence[Var] | None = None) -> Var | Tuple[Var, ...]:
         assert not self.is_terminated
+        force_type = False
         if isinstance(result_ty, tuple):
-            ret = tuple(self.ir_ctx.make_temp(self._loc) for _ in result_ty)
-            for var, ty in zip(ret, result_ty, strict=True):
+            if result is None:
+                result = tuple(self.ir_ctx.make_temp(self._loc) for _ in result_ty)
+            else:
+                result = tuple(result)
+                assert all(isinstance(v, Var) for v in result)
+                force_type = True
+
+            for var, ty in zip(result, result_ty, strict=True):
                 if ty is not None:
-                    var.set_type(ty)
-            if len(ret) > 0 or op_class._multiple_results:
-                attrs_and_operands["result_vars"] = ret
+                    var.set_type(ty, force=force_type)
+            if len(result) > 0 or op_class._multiple_results:
+                attrs_and_operands["result_vars"] = result
         else:
-            ret = self.ir_ctx.make_temp(self._loc)
+            if result is None:
+                result = self.ir_ctx.make_temp(self._loc)
+            else:
+                assert isinstance(result, Var)
+                force_type = True
             if result_ty is not None:
-                ret.set_type(result_ty)
-            attrs_and_operands["result_var"] = ret
+                result.set_type(result_ty, force=force_type)
+            attrs_and_operands["result_var"] = result
 
         new_op = op_class(**attrs_and_operands, loc=self._loc)
         self._ops.append(new_op)
         if new_op.is_terminator:
             self.is_terminated = True
-        return ret
+        return result
+
+    def make_aggregate(self,
+                       value: AggregateValue,
+                       ty: Type | None,
+                       loose_ty: Type | None = None,
+                       result_var: Var | None = None) -> Var:
+        force_type = True
+        if result_var is None:
+            result_var = self.ir_ctx.make_temp(self._loc)
+            force_type = False
+
+        if ty is not None:
+            result_var.set_type(ty, force=force_type)
+        if loose_ty is not None:
+            result_var.set_loose_type(ty, force=force_type)
+        result_var.set_aggregate(value)
+        return result_var
 
     @property
     def ops(self) -> list[Operation]:
@@ -591,6 +692,12 @@ class Operation:
         return self._has_side_effects
 
     def _add_operand(self, name: str, var: Var | Tuple[Var, ...]):
+        if isinstance(var, Var) and var.is_aggregate() and self.op != "assign":
+            # Don't allow aggregate values as operands, except for arrays and lists.
+            # All other aggregates should only exist in the HIR level.
+            # Also make an exception for the Assign op, until we find a better way to handle it.
+            agg_val = var.get_aggregate()
+            assert isinstance(agg_val, ArrayValue | ListValue)
         self._operands[name] = var
 
     def update_operand(self, name: str, var: Var | Tuple[Var, ...]):
@@ -630,9 +737,10 @@ class Operation:
         operands_str_list = []
         for name, val in self.operands.items():
             if isinstance(val, Var):
-                operands_str_list.append(f"{name}={str(val)}")
+                operands_str_list.append(f"{name}={var_aggregate_name(val)}")
             elif isinstance(val, tuple) and all(isinstance(v, Var) for v in val):
-                operands_str_list.append(f"{name}=({', '.join(str(v) for v in val)})")
+                tup_str = ', '.join(var_aggregate_name(v) for v in val)
+                operands_str_list.append(f"{name}=({tup_str})")
             elif val is None:
                 operands_str_list.append(f"{name}=None")
             else:
@@ -655,14 +763,6 @@ class Operation:
                   indent: int = 0,
                   highlight_loc: Optional[Loc] = None,
                   include_loc: bool = False) -> str:
-        def format_var(var: Var):
-            ty = var.try_get_type()
-            if ty is None:
-                return var.name
-            else:
-                const_prefix = "const " if var.is_constant() else ""
-                return f"{var.name}: {const_prefix}{ty}"
-
         indent_str = " " * indent
         lhs = (
             ", ".join(format_var(var) for var in self.result_vars)
@@ -696,6 +796,24 @@ class Operation:
 
     def __str__(self) -> str:
         return self.to_string()
+
+
+def var_aggregate_name(var: Var) -> str:
+    ret = var.name
+    if var.is_aggregate():
+        ret += "{" + ", ".join(x.name for x in var.flatten_aggregate()) + "}"
+    return ret
+
+
+def format_var(var: Var) -> str:
+    ret = var_aggregate_name(var)
+
+    ty = var.try_get_type()
+    if ty is not None:
+        const_prefix = "const " if var.is_constant() else ""
+        ret += f": {const_prefix}{ty}"
+
+    return ret
 
 
 # TODO: no longer needed, remove by inheriting from Operation instead
@@ -777,14 +895,15 @@ class Block:
                   indent: int = 0,
                   highlight_loc: Optional[Loc] = None,
                   include_loc: bool = False) -> str:
-        op_strings = (
+        params = ", ".join(format_var(p) for p in self.params)
+        ops = "\n".join(
             op.to_string(
                 indent,
                 highlight_loc,
                 include_loc
             ) for op in self.operations
         )
-        return "\n".join(op_strings)
+        return f"{' ' * indent}({params}):\n{ops}"
 
     def traverse(self) -> Iterator[Operation]:
         for op in self.operations:

@@ -4,7 +4,7 @@
 
 from typing import Union, TYPE_CHECKING, Tuple, Optional
 
-from cuda.tile._ir.type import TileTy, TupleTy
+from cuda.tile._ir.type import TileTy
 from cuda.tile import PaddingMode
 from cuda.tile._bytecode.attribute import make_load_store_hints
 from cuda.tile._ir import ir
@@ -47,18 +47,17 @@ def _create_common_kwargs(op, ctx: BytecodeContext):
                 memory_scope=None)
 
 
-def _get_index_tuple(index: ir.Var, ctx: BytecodeContext) -> Tuple[bc.Value, ...]:
+def _get_index_tuple(index: tuple[ir.Var, ...], ctx: BytecodeContext) -> Tuple[bc.Value, ...]:
     i32_tile_ty = ctx.type_table.tile(ctx.type_table.I32, ())
-    index_ty = ctx.typeof(index)
-    item_types = index_ty.value_types if isinstance(index_ty, TupleTy) else (index_ty,)
-    index_values = ctx.get_value_tuple(index)
+    item_types = tuple(x.get_type() for x in index)
+    index_values = tuple(ctx.get_value(x) for x in index)
     return tuple(bc.encode_TruncIOp(ctx.builder, i32_tile_ty, v, bc.IntegerOverflow.NONE)
                  if (t.dtype if isinstance(t, TileTy) else t).bitwidth > 32 else v
                  for v, t in zip(index_values, item_types, strict=True))
 
 
 def tile_load_generate_bytecode(op: Union["TileLoad", "TileLoadTokenOrdered"],
-                                ctx: BytecodeContext) -> tuple[tuple[bc.Value], tuple[bc.Value]]:
+                                ctx: BytecodeContext) -> tuple[bc.Value, bc.Value]:
     tile_type: TileTy = op.result_vars[0].get_type()
     shape = tile_type.shape_value
     padding_mode = op.padding_mode
@@ -72,7 +71,7 @@ def tile_load_generate_bytecode(op: Union["TileLoad", "TileLoadTokenOrdered"],
         index=_get_index_tuple(op.index, ctx),
         **_create_common_kwargs(op, ctx)
     )
-    return (res,), (res_token,)
+    return res, res_token
 
 
 def tile_store_generate_bytecode(op: Union["TileStore", "TileStoreTokenOrdered"],

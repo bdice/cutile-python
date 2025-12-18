@@ -7,7 +7,7 @@ from typing import Optional, Set, Dict, DefaultDict, Mapping, NamedTuple
 
 from cuda.tile._ir.ir import Block, Var, Mapper, IRContext
 from cuda.tile._ir.ops import (Loop, IfElse, RawBinaryArithmeticOperation, RawComparisonOperation,
-                               Assign, UnpackRange, Range, EndBranch, Continue, TypedConst)
+                               Assign, EndBranch, Continue, TypedConst)
 
 
 class _Condition(NamedTuple):
@@ -47,9 +47,9 @@ def _find_splittable_loops(block: Block,
         elif isinstance(op, Assign):
             equiv_map[op.result_var.name] = equiv_map.get(op.value.name, op.value)
         elif isinstance(op, Loop):
-            good_loop = (op.iterable is not None
-                         and op.iterable.has_range_info()
-                         and op.iterable.get_range_info().known_step == 1)
+            good_loop = (op.is_for_loop
+                         and op.step.is_constant()
+                         and op.step.get_constant() == 1)
             _find_splittable_loops(
                 op.body,
                 def_depth,
@@ -90,59 +90,48 @@ def _apply_splits(block: Block,
 
 # This is horrible
 def _split_loop(loop: Loop, cond: _Condition, if_ops_to_flatten: Set[IfElse], new_block: Block):
-    typemap = new_block.ctx.typemap
-
-    range_ty = typemap[loop.iterable.name]
-    range_dtype = range_ty.dtype
+    range_dtype = loop.start.get_type()
     split_value = cond.rhs
     loc = loop.loc
     if _NEED_TO_ADJUST_RANGE[cond.cmp]:
         one_var = new_block.make_temp_var(loc)
         new_block.append(TypedConst(1, one_var, loc))
-        typemap[one_var.name] = range_dtype
+        one_var.set_type(range_dtype)
         plus_one_var = new_block.make_temp_var(loc)
         new_block.append(RawBinaryArithmeticOperation("add", split_value, one_var, None, False,
                                                       plus_one_var, loc))
-        typemap[plus_one_var.name] = range_dtype
+        plus_one_var.set_type(range_dtype)
         split_value = plus_one_var
 
-    orig_start, orig_stop, orig_step = new_block.make_temp_vars(loc, 3)
-    new_block.append(UnpackRange(loop.iterable,
-                                 (orig_start, orig_stop, orig_step), loc))
-
     first_loop_stop = new_block.make_temp_var(loc)
-    new_block.append(RawBinaryArithmeticOperation("min", orig_stop, split_value, None, False,
+    new_block.append(RawBinaryArithmeticOperation("min", loop.stop, split_value, None, False,
                                                   first_loop_stop, loc))
 
     second_loop_start = new_block.make_temp_var(loc)
-    new_block.append(RawBinaryArithmeticOperation("max", orig_start, split_value, None, False,
+    new_block.append(RawBinaryArithmeticOperation("max", loop.start, split_value, None, False,
                                                   second_loop_start, loc))
 
-    for var in orig_start, orig_stop, orig_step, first_loop_stop, second_loop_start:
-        typemap[var.name] = range_dtype
-
-    first_range, second_range = new_block.make_temp_vars(loc, 2)
-    new_block.append(Range(orig_start, first_loop_stop, orig_step, first_range, loc))
-    new_block.append(Range(second_loop_start, orig_stop, orig_step, second_range, loc))
-    for var in first_range, second_range:
-        typemap[var.name] = range_ty
+    for var in first_loop_stop, second_loop_start:
+        var.set_type(range_dtype)
 
     first_branch, second_branch = _BRANCH_TO_KEEP[cond.cmp]
 
     intermediate_vars = tuple(new_block.ctx.make_var_like(v) for v in loop.result_vars)
     for old_var, new_var in zip(loop.result_vars, intermediate_vars, strict=True):
-        typemap[new_var.name] = typemap[old_var.name]
+        new_var.set_type(old_var.get_type())
 
-    new_block.append(_clone_loop(loop, first_range, loop.initial_values, intermediate_vars,
+    new_block.append(_clone_loop(loop, loop.start, first_loop_stop, loop.step,
+                                 loop.initial_values, intermediate_vars,
                                  if_ops_to_flatten, first_branch, new_block.ctx))
 
-    second_loop = _clone_loop(loop, second_range, intermediate_vars, loop.result_vars,
+    second_loop = _clone_loop(loop, second_loop_start, loop.stop, loop.step,
+                              intermediate_vars, loop.result_vars,
                               if_ops_to_flatten, second_branch, new_block.ctx)
     new_block.append(second_loop)
 
 
-def _clone_loop(loop: Loop, new_range: Var, initial_vars: tuple[Var, ...],
-                result_vars: tuple[Var, ...],
+def _clone_loop(loop: Loop, new_start: Var, new_stop: Var, new_step: Var,
+                initial_vars: tuple[Var, ...], result_vars: tuple[Var, ...],
                 if_ops_to_flatten: Set[IfElse], branch_to_keep: str, ctx: IRContext) -> Loop:
     mapper = Mapper(ctx)
     new_params = mapper.clone_vars(loop.body.params)
@@ -170,7 +159,7 @@ def _clone_loop(loop: Loop, new_range: Var, initial_vars: tuple[Var, ...],
         else:
             new_body.append(body_op.clone(mapper))
 
-    return Loop(new_range, initial_vars, result_vars, new_body, loop.loc)
+    return Loop(new_start, new_stop, new_step, initial_vars, result_vars, new_body, loop.loc)
 
 
 def split_loops(block: Block):

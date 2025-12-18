@@ -829,16 +829,16 @@ ForLoopAliasCheckDirective = """\
 // CHECK: %[[TOKEN0:.*]] = make_token
 // CHECK: %[[X_TOKEN1:.*]] = store_view_tko {{.*}} token = %[[TOKEN0]]
 // CHECK: %[[Y_TOKEN1:.*]] = store_view_tko {{.*}} token = %[[TOKEN0]]
-// CHECK: %[[LOOP_RESULTS:.*]]:7 = for {{.*}} iter_values(
-// CHECK-SAME: {{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[UNI_TKNARG0:.*]] = %[[TOKEN0]],
+// CHECK: %[[LOOP_RESULTS:.*]]:6 = for {{.*}} iter_values(
+// CHECK-SAME: {{.*}}, {{.*}}, {{.*}}, %[[UNI_TKNARG0:.*]] = %[[TOKEN0]],
 // CHECK-SAME: %[[Y_TKNARG0:.*]] = %[[Y_TOKEN1]], %[[Y_TKNARG1:.*]] = %[[Y_TOKEN1]])
 // CHECK:     %[[JOINT_TOKEN2:.*]] = join_tokens %[[TOKEN0]], %[[X_TOKEN1]], %[[Y_TKNARG1]]
 // CHECK:     {{.*}}, %[[UNI_TOKEN2:.*]] = load_view_tko weak {{.*}} token = %[[JOINT_TOKEN2]]
 // CHECK:     %[[UNI_TOKEN3:.*]] = join_tokens %[[UNI_TKNARG0]], %[[UNI_TOKEN2]]
 // CHECK:     %[[JOINT_TOKEN3:.*]] = join_tokens %[[Y_TKNARG0]], %[[UNI_TOKEN3]]
 // CHECK:     %[[Y_TOKEN2:.*]] = store_view_tko {{.*}} token = %[[JOINT_TOKEN3]]
-// CHECK:     continue  {{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[UNI_TOKEN3]], %[[Y_TOKEN2]], %[[Y_TOKEN2]]
-// CHECK: %[[JOINT_TOKEN4:.*]] = join_tokens %[[LOOP_RESULTS]]#5, %[[LOOP_RESULTS]]#4
+// CHECK:     continue  {{.*}}, {{.*}}, {{.*}}, %[[UNI_TOKEN3]], %[[Y_TOKEN2]], %[[Y_TOKEN2]]
+// CHECK: %[[JOINT_TOKEN4:.*]] = join_tokens %[[LOOP_RESULTS]]#4, %[[LOOP_RESULTS]]#3
 // CHECK: %[[Y_TOKEN3:.*]] = store_view_tko {{.*}} token = %[[JOINT_TOKEN4]]
 // CHECK: %[[Z_TOKEN1:.*]] = store_view_tko {{.*}} token = %[[TOKEN0]]
 """  # noqa: E501
@@ -859,25 +859,19 @@ ControlFlowTupleAliasCheckDirective = """\
 // CHECK: %[[TOKEN0:.*]] = make_token
 // CHECK: %[[X_TOKEN1:.*]] = store_view_tko {{.*}} token = %[[TOKEN0]]
 // CHECK: %[[Y_TOKEN1:.*]] = store_view_tko {{.*}} token = %[[TOKEN0]]
-// CHECK: %[[LOOP_RESULTS:.*]]:7 = for {{.*}} iter_values(
-// CHECK-SAME: {{.*}}, {{.*}}, {{.*}}, %[[UNI_TKNARG0:.*]] = %[[TOKEN0]], %[[UNI_TKNARG1:.*]] = %[[TOKEN0]],
-// CHECK-SAME: %[[Y_TKNARG0:.*]] = %[[Y_TOKEN1]], %[[Y_TKNARG1:.*]] = %[[Y_TOKEN1]])
-// CHECK:     %[[IFELSE_RESULTS:.*]]:7 = if
-// CHECK:         %[[JOINT_TOKEN2:.*]] = join_tokens %[[UNI_TKNARG0]], %[[X_TOKEN1]], %[[Y_TKNARG0]]
-// CHECK:         %[[UNI_TOKEN1:.*]] = store_view_tko {{.*}} token = %[[JOINT_TOKEN2]]
-// CHECK:         yield {{.*}}, {{.*}}, {{.*}}, %[[UNI_TOKEN1]], %[[UNI_TOKEN1]], %[[Y_TKNARG0]], %[[Y_TKNARG1]]
+// CHECK: %[[LOOP_RESULTS:.*]]:4 = for {{.*}} iter_values(
+// CHECK-SAME: {{.*}}, {{.*}}, %[[Y_TKNARG0:.*]] = %[[Y_TOKEN1]], %[[Y_TKNARG1:.*]] = %[[Y_TOKEN1]])
+// CHECK:     %[[IFELSE_RESULTS:.*]]:4 = if
+// CHECK:         %[[Y_TOKEN2:.*]] = store_view_tko {{.*}} token = %[[Y_TKNARG0]]
+// CHECK:         yield {{.*}}, {{.*}}, %[[Y_TOKEN2]], %[[Y_TOKEN2]]
 // CHECK:     else
-// CHECK:         %[[JOINT_TOKEN2:.*]] = join_tokens %[[Y_TKNARG0]], %[[UNI_TKNARG0]]
-// CHECK:         %[[Y_TOKEN2:.*]] = store_view_tko {{.*}} token = %[[JOINT_TOKEN2]]
-// CHECK:         yield {{.*}}, {{.*}}, {{.*}}, %[[UNI_TKNARG0]], %[[UNI_TKNARG1]], %[[Y_TOKEN2]], %[[Y_TOKEN2]]
-// CHECK:     continue {{.*}}, {{.*}}, {{.*}}, %[[IFELSE_RESULTS]]#3, %[[IFELSE_RESULTS]]#4, %[[IFELSE_RESULTS]]#5, %[[IFELSE_RESULTS]]#6
-// CHECK: %[[JOINT_TOKEN3:.*]] = join_tokens %[[LOOP_RESULTS]]#6, %[[LOOP_RESULTS]]#4
-// CHECK: {{.*}}, %[[Y_TOKEN3:.*]] = load_view_tko weak {{.*}} token = %[[JOINT_TOKEN3]]
-// CHECK: %[[Y_TOKEN4:.*]] = join_tokens %[[LOOP_RESULTS]]#5, %[[Y_TOKEN3]]
-// CHECK: %[[JOINT_TOKEN3:.*]] = join_tokens %[[LOOP_RESULTS]]#3, %[[X_TOKEN1]], %[[Y_TOKEN4]]
-// CHECK: %[[UNI_TOKEN2:.*]] = store_view_tko {{.*}} token = %[[JOINT_TOKEN3]]
-// CHECK: %[[JOINT_TOKEN4:.*]] = join_tokens %[[X_TOKEN1]], %[[UNI_TOKEN2]]
-// CHECK: %[[X_TOKEN2:.*]] = store_view_tko {{.*}} token = %[[JOINT_TOKEN4]]
+// CHECK:         %[[Y_TOKEN3:.*]] = store_view_tko {{.*}} token = %[[Y_TKNARG0]]
+// CHECK:         yield {{.*}}, {{.*}}, %[[Y_TOKEN3]], %[[Y_TOKEN3]]
+// CHECK:     continue {{.*}}, {{.*}}, %[[IFELSE_RESULTS]]#2, %[[IFELSE_RESULTS]]#3
+// CHECK: {{.*}}, %[[Y_TOKEN4:.*]] = load_view_tko weak {{.*}} token = %[[LOOP_RESULTS]]#3
+// CHECK: %[[Y_TOKEN5:.*]] = join_tokens %[[LOOP_RESULTS]]#2, %[[Y_TOKEN4]]
+// CHECK: %[[Y_TOKEN6:.*]] = store_view_tko {{.*}} token = %[[Y_TOKEN5]]
+// CHECK: %[[X_TOKEN2:.*]] = store_view_tko {{.*}} token = %[[X_TOKEN1]]
 """  # noqa: E501
 
 
