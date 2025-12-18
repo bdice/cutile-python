@@ -324,13 +324,13 @@ def _to_token_order_in_block(block: Block,
         elif isinstance(op, Continue):
             tokens = _get_cf_exit_tokens(innermost_loop_info.loop_mem_effects, token_map)
 
-            new_continue_op = Continue(op.loc, tuple(op.next_vars) + tokens)
+            new_continue_op = Continue(op.loc, tuple(op.values) + tokens)
             operations.append(new_continue_op)
 
         elif isinstance(op, Break):
             tokens = _get_cf_exit_tokens(innermost_loop_info.loop_mem_effects, token_map)
 
-            new_break_op = Break(op.loc, tuple(op.output_vars) + tokens)
+            new_break_op = Break(op.loc, tuple(op.values) + tokens)
             operations.append(new_break_op)
 
         elif isinstance(op, IfElse):

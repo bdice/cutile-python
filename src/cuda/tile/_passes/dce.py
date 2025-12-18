@@ -124,13 +124,13 @@ def _build_dataflow_graph(graph: Dict[str, List[str] | Tuple[str, ...]],
             graph[innermost_loop_name].append(innermost_cf_name)
 
             # "Next" values feed into the body variables of the next iteration
-            for body_var, next_var in zip(innermost_loop.body_vars, op.next_vars, strict=True):
+            for body_var, next_var in zip(innermost_loop.body_vars, op.values, strict=True):
                 graph[body_var.name].append(next_var.name)
 
             # In a `for` loop, "next" values can also feed into the loop's results.
             # That's because the loop can immediately exit if the iterator has been exhausted.
             if innermost_loop.iterable is not None:
-                for res_var, next_var in zip(innermost_loop.result_vars, op.next_vars, strict=True):
+                for res_var, next_var in zip(innermost_loop.result_vars, op.values, strict=True):
                     graph[res_var.name].append(next_var.name)
         elif isinstance(op, Break):
             assert innermost_loop_name is not None
@@ -139,7 +139,7 @@ def _build_dataflow_graph(graph: Dict[str, List[str] | Tuple[str, ...]],
             graph[innermost_loop_name].append(innermost_cf_name)
 
             # "Output" values feed into the loop's result variables
-            for res_var, out_var in zip(innermost_loop.result_vars, op.output_vars, strict=True):
+            for res_var, out_var in zip(innermost_loop.result_vars, op.values, strict=True):
                 graph[res_var.name].append(out_var.name)
         elif isinstance(op, IfElse):
             cf_name = _make_control_flow_name(block.ctx)
@@ -214,12 +214,12 @@ def _prune_block(block: Block,
                 new_ops.append(Loop(op.iterable, new_initial_values, new_result_vars, op.body,
                                     op.loc))
         elif isinstance(op, Continue):
-            _mark_unused_vars_as_undefined(op.next_vars, loop_mask, used_vars)
-            next_vars = _select_by_mask(op.next_vars, loop_mask)
+            _mark_unused_vars_as_undefined(op.values, loop_mask, used_vars)
+            next_vars = _select_by_mask(op.values, loop_mask)
             new_ops.append(Continue(op.loc, next_vars))
         elif isinstance(op, Break):
-            _mark_unused_vars_as_undefined(op.output_vars, loop_mask, used_vars)
-            output_vars = _select_by_mask(op.output_vars, loop_mask)
+            _mark_unused_vars_as_undefined(op.values, loop_mask, used_vars)
+            output_vars = _select_by_mask(op.values, loop_mask)
             new_ops.append(Break(op.loc, output_vars))
         elif isinstance(op, IfElse):
             if op_to_cf_name[op] in used_vars:

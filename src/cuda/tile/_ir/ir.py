@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import itertools
 import threading
@@ -54,8 +55,8 @@ class IRContext:
     def make_var_like(self, var: Var) -> Var:
         return self.make_var(self.get_original_name(var.name), var.loc, var.is_undefined())
 
-    def make_temp(self, loc: Loc) -> Var:
-        return self.make_var(f"${next(self._temp_counter)}", loc)
+    def make_temp(self, loc: Loc, undefined: bool = False) -> Var:
+        return self.make_var(f"${next(self._temp_counter)}", loc, undefined=undefined)
 
     def get_original_name(self, var_name: str) -> str:
         return self._all_vars[var_name]
@@ -127,10 +128,9 @@ class PhiState:
             if self.loose_ty != src_loose_ty:
                 self.loose_ty = self.ty
 
-    def finalize(self, dst: Var):
+    def finalize_constant_and_loose_type(self, dst: Var):
         if self.constant_state == ConstantState.MAY_BE_CONSTANT:
             dst.set_constant(self.constant_value)
-        dst.set_type(self.ty)
         dst.set_loose_type(self.loose_ty)
 
 
@@ -302,26 +302,22 @@ class LoopVarState:
 
 
 @dataclass
-class LoopInfo:
-    var_states: tuple[LoopVarState, ...]
-    is_for_loop: bool
-    stored_names: tuple[str, ...]
-    flatten: bool = False
+class JumpInfo:
+    jump_op: Operation | None
+    outputs: tuple[Var, ...]
 
 
 @dataclass
-class IfElseInfo:
-    result_phis: tuple[PhiState, ...]
+class ControlFlowInfo:
     stored_names: tuple[str, ...]
     flatten: bool = False
-    flattened_results: tuple[Var, ...] = ()
-    have_end_branch: bool = False
+    jumps: list[JumpInfo] = dataclasses.field(default_factory=list)
 
 
 @contextmanager
 def nested_block(name: str, loc: Loc, params: Sequence[Var] = (),
-                 loop_info: LoopInfo | None = None,
-                 if_else_info: IfElseInfo | None = None):
+                 loop_info: ControlFlowInfo | None = None,
+                 if_else_info: ControlFlowInfo | None = None):
     prev_builder = Builder.get_current()
     block = Block(prev_builder.ir_ctx, params=params, name=name, loc=loc)
     new_loop_info = loop_info or prev_builder.loop_info
@@ -416,8 +412,8 @@ class Scope:
 
 class Builder:
     def __init__(self, ctx: IRContext, loc: Loc, scope: Scope,
-                 loop_info: LoopInfo | None = None,
-                 if_else_info: IfElseInfo | None = None):
+                 loop_info: ControlFlowInfo | None = None,
+                 if_else_info: ControlFlowInfo | None = None):
         self.ir_ctx = ctx
         self.scope = scope
         self.is_terminated = False
@@ -482,7 +478,7 @@ class Builder:
             self._loc = old_loc
 
     @contextmanager
-    def change_if_else_info(self, new_info: IfElseInfo):
+    def change_if_else_info(self, new_info: ControlFlowInfo):
         old = self.if_else_info
         self.if_else_info = new_info
         try:
@@ -491,7 +487,7 @@ class Builder:
             self.if_else_info = old
 
     @contextmanager
-    def change_loop_info(self, new_info: LoopInfo):
+    def change_loop_info(self, new_info: ControlFlowInfo):
         old = self.loop_info
         self.loop_info = new_info
         try:

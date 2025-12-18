@@ -22,8 +22,8 @@ from cuda.tile._exception import (
 from cuda.tile._ir.ir import (
     Operation, Var, Loc, Block,
     has_side_effects, terminator, add_operation, TypedOperation, RangeInfo, Builder,
-    has_multiple_results, nested_block, PhiState, LoopInfo, LoopVarState,
-    IfElseInfo
+    has_multiple_results, nested_block, PhiState, LoopVarState,
+    JumpInfo, ControlFlowInfo
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
@@ -52,7 +52,7 @@ from .typing_support import typeof_pyval, dtype_registry, loose_type_of_pyval, g
 from .type import (
     TupleTy, TileTy, NoneType, BoundMethodTy, SizeTy, ArrayTy,
     ListTy, make_tile_ty, SliceType, DTypeConstructor, PointerTy, RangeIterType, Type,
-    NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy
+    NONE, ModuleTy, TypeTy, LooselyTypedScalar, DTypeSpec, StringTy, InvalidType
 )
 from cuda.tile._datatype import (
     DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float,
@@ -169,10 +169,10 @@ def loop_impl(body: hir.Block, iterable: Var):
 
     range_ty = require_optional_range_type(iterable)
     if range_ty is None and body.jump == hir.Jump.BREAK and not _have_nested_jump(body.calls):
-        # In ast2hir, we create a loop around the body in order to support early returns.
-        # But if there is no early return, we can remove the loop. In this case the loop
-        # will only have a "break" at the end of the body, and no other break/continue statements.
-        info = LoopInfo((), False, (), flatten=True)
+        # In ast2hir, we create a loop around the function body in order to support early returns.
+        # But if there is no early return, we can remove the loop. In this case, the loop will only
+        # have a "break" at the end of the loop body, and no other break/continue statements.
+        info = ControlFlowInfo((), flatten=True)
         with Builder.get_current().change_loop_info(info):
             dispatch_hir_block(body)
         return ()
@@ -183,13 +183,20 @@ def loop_impl(body: hir.Block, iterable: Var):
     var_states = tuple(LoopVarState(PhiState(), PhiState()) for _ in stored_names)
     initial_values = tuple(local_scope.get(name, builder.loc) for name in stored_names)
 
+    # Logic specific to `for` loops:
     if range_ty is not None:
+        # A `for` loop may have 0 iterations, so initial values need to be propagated
+        # to the loop's results.
         for initial_var, state in zip(initial_values, var_states, strict=True):
             state.result_phi.propagate(initial_var)
         # Assign type to induction variable
         body.params[0].set_type(range_ty.dtype)
 
-    with local_scope.enter_branch():
+    # Process the loop body
+    loop_info = ControlFlowInfo(stored_names)
+    with nested_block(body.name, body.loc, loop_info=loop_info) as new_body:
+        # Define body variables. Not all of them will eventually be kept,
+        # so we don't set the block parameters yet.
         body_vars = []
         for name, initial_var, state in zip(stored_names, initial_values, var_states, strict=True):
             state.body_phi.set_nonconstant()
@@ -197,23 +204,64 @@ def loop_impl(body: hir.Block, iterable: Var):
             body_var = local_scope.redefine(name, state.body_phi.last_loc)
             body_var.set_type(state.body_phi.ty)
             body_vars.append(body_var)
+        # Dispatch the body (hir.Block) to populate the new_body (ir.Block) with Operations
+        dispatch_hir_block(body)
 
-        loop_info = LoopInfo(var_states, range_ty is not None, stored_names)
-        params = body.params + tuple(body_vars)
-        with nested_block(body.name, body.loc, params, loop_info=loop_info) as new_body:
-            dispatch_hir_block(body)
+    # Propagate type information from Continue/Break to body/result phis
+    for jump_info in loop_info.jumps:
+        is_continue = isinstance(jump_info.jump_op, Continue)
+        assert is_continue or isinstance(jump_info.jump_op, Break)
+        for output, state in zip(jump_info.outputs, var_states, strict=True):
+            if is_continue:
+                state.body_phi.propagate(output, fail_eagerly=True)
+            if range_ty is not None or not is_continue:
+                state.result_phi.propagate(output)
 
-        for body_var, state in zip(body_vars, var_states, strict=True):
-            state.finalize_loopvar_type(body_var)
+    # Determine the final loop variable types and filter out invalid variables
+    mask = []
+    for body_var, state in zip(body_vars, var_states, strict=True):
+        state.finalize_loopvar_type(body_var)
+        is_valid = not isinstance(body_var.get_type_allow_invalid(), InvalidType)
+        mask.append(is_valid)
+        if not is_valid:
+            body_var.set_undefined()
 
-    result_vars = add_operation(Loop, (None,) * len(var_states),
+    # Set the block's parameters
+    valid_body_vars = tuple(v for v, is_valid in zip(body_vars, mask, strict=True) if is_valid)
+    new_body.params = body.params + valid_body_vars
+
+    # Update Continue/Break statements
+    for jump_info in loop_info.jumps:
+        values = tuple(out for out, is_valid in zip(jump_info.outputs, mask, strict=True)
+                       if is_valid)
+        jump_info.jump_op.update_operand("values", values)
+
+    # Create the loop Operation
+    valid_initial_values = tuple(v for v, is_valid in zip(initial_values, mask, strict=True)
+                                 if is_valid)
+    result_types = tuple(s.result_phi.ty for s, is_valid in zip(var_states, mask, strict=True)
+                         if is_valid)
+    result_vars = add_operation(Loop, result_types,
                                 iterable=None if range_ty is None else iterable,
-                                initial_values=initial_values,
+                                initial_values=valid_initial_values,
                                 body=new_body)
 
-    for res, state, name in zip(result_vars, var_states, stored_names, strict=True):
-        state.result_phi.finalize(res)
+    # Finalize the scope & type information for valid result variables
+    valid_var_states = tuple(s for s, is_valid in zip(var_states, mask, strict=True)
+                             if is_valid)
+    valid_stored_names = tuple(n for n, is_valid in zip(stored_names, mask, strict=True)
+                               if is_valid)
+    for res, state, name in zip(result_vars, valid_var_states, valid_stored_names, strict=True):
+        state.result_phi.finalize_constant_and_loose_type(res)
         store_var(name, res, state.result_phi.last_loc)
+
+    # For any names that are stored within the loop body but have an invalid result type,
+    # we update the scope to point to an undefined variable of this invalid type, so that
+    # using that variable afterwards would result in a type error.
+    for body_var, state, name, is_valid in zip(body_vars, var_states, stored_names, mask,
+                                               strict=True):
+        if not is_valid:
+            store_undefined(name, body_var.get_type_allow_invalid(), state.result_phi.last_loc)
 
     return ()
 
@@ -279,10 +327,14 @@ class IfElse(TypedOperation):
 
 def _flatten_branch(branch: hir.Block) -> tuple[Var, ...]:
     from .._passes.hir2ir import dispatch_hir_block
-    info = IfElseInfo((), (), flatten=True)
+    info = ControlFlowInfo((), flatten=True)
     with Builder.get_current().change_if_else_info(info):
         dispatch_hir_block(branch)
-    return info.flattened_results
+    if len(info.jumps) == 0:
+        return ()
+    else:
+        assert len(info.jumps) == 1
+        return info.jumps[0].outputs
 
 
 @impl(hir.if_else)
@@ -294,23 +346,12 @@ def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tup
         branch_taken = then_block if cond.get_constant() else else_block
         return _flatten_branch(branch_taken)
 
-    # Figure out the number of explicit results
-    num_explicit_results = 0
-    if then_block.jump == hir.Jump.END_BRANCH:
-        num_explicit_results = len(then_block.results)
-    elif else_block.jump == hir.Jump.END_BRANCH:
-        num_explicit_results = len(else_block.results)
-
     # Get the total number of results by adding the number of stored variables.
     # Note: we sort the stored variable names to make the order deterministic.
     stored_names = tuple(sorted(then_block.stored_names | else_block.stored_names))
-    num_results = num_explicit_results + len(stored_names)
 
-    # Initialize an IfElseInfo struct
-    result_phis = tuple(PhiState() for _ in range(num_results))
-    info = IfElseInfo(result_phis, stored_names)
-
-    # Convert each branch from HIR to IR
+    # Convert the "then" branch from HIR to IR
+    info = ControlFlowInfo(stored_names)
     with nested_block(then_block.name, then_block.loc, if_else_info=info) as new_then_block:
         dispatch_hir_block(then_block)
 
@@ -321,29 +362,65 @@ def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tup
     #        EndBranch
     #    <else_block>
     # This is to avoid the situation where none of the branches yield.
-    if not info.have_end_branch:
-        info = IfElseInfo((), ())
+    if len(info.jumps) == 0:
+        info = ControlFlowInfo(())
         with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
             end_branch(())
         add_operation(IfElse, (),
                       cond=cond, then_block=new_then_block, else_block=new_else_block)
         return _flatten_branch(else_block)
 
+    # Convert the "else" branch from HIR to IR
     with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
         dispatch_hir_block(else_block)
 
-    # Generate an IfElse op. Don't set result types yet -- phi.finalize() will do the work.
-    result_vars = add_operation(IfElse, (None,) * num_results,
-                                cond=cond, then_block=new_then_block, else_block=new_else_block)
-    # Infer the result types & constants
-    for var, phi in zip(result_vars, result_phis, strict=True):
-        phi.finalize(var)
+    # Do type/constant propagation
+    num_results = len(info.jumps[0].outputs)
+    result_phis = tuple(PhiState() for _ in range(num_results))
+    for jump_info in info.jumps:
+        for phi, v in zip(result_phis, jump_info.outputs, strict=True):
+            phi.propagate(v)
 
-    # Update the scope
-    for var, phi, name in zip(result_vars[num_explicit_results:],
-                              result_phis[num_explicit_results:], stored_names, strict=True):
-        store_var(name, var, phi.last_loc)
-    return result_vars[:num_explicit_results]
+    # Determine which results have valid types
+    mask = tuple(not isinstance(phi.ty, InvalidType) for phi in result_phis)
+
+    # Update the EndBranch operations by setting the outputs
+    for jump_info in info.jumps:
+        outputs = tuple(v for v, is_valid in zip(jump_info.outputs, mask, strict=True)
+                        if is_valid)
+        jump_info.jump_op.update_operand("outputs", outputs)
+
+    # Generate an IfElse op
+    valid_result_types = tuple(phi.ty for phi, is_valid in zip(result_phis, mask) if is_valid)
+    valid_results = add_operation(IfElse, valid_result_types,
+                                  cond=cond, then_block=new_then_block, else_block=new_else_block)
+
+    # Finalize the constant/loose type information
+    valid_result_phis = tuple(phi for phi, is_valid in zip(result_phis, mask) if is_valid)
+    for var, phi in zip(valid_results, valid_result_phis, strict=True):
+        phi.finalize_constant_and_loose_type(var)
+
+    it = iter(valid_results)
+    all_results = tuple(next(it) if is_valid else None for is_valid in mask)
+    assert next(it, None) is None
+
+    builder = Builder.get_current()
+
+    # Get/create variables for explicit results
+    num_explicit_results = num_results - len(stored_names)
+    ret = tuple(builder.ir_ctx.make_temp(builder.loc, undefined=True)
+                if res_var is None else res_var
+                for res_var in all_results[:num_explicit_results])
+
+    # Update the scope for stored named
+    for res_var, phi, name in zip(all_results[num_explicit_results:],
+                                  result_phis[num_explicit_results:], stored_names, strict=True):
+        if res_var is None:
+            store_undefined(name, phi.ty, phi.last_loc)
+        else:
+            store_var(name, res_var, phi.last_loc)
+
+    return ret
 
 
 # Maps to ContinueOp in TileIR
@@ -352,21 +429,21 @@ class Continue(TypedOperation):
     def __init__(
         self,
         loc: Loc,
-        next_vars: Tuple[Var, ...] = (),
+        values: Tuple[Var, ...] = (),
     ):
-        super().__init__("continue", operands={"next_vars": next_vars}, result_vars=[], loc=loc)
+        super().__init__("continue", operands={"values": values}, result_vars=[], loc=loc)
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
         next_values = [value
-                       for var, body_var in zip(self.next_vars, ctx.innermost_loop.body_vars)
+                       for var, body_var in zip(self.values, ctx.innermost_loop.body_vars)
                        for value in ctx.get_value_tuple_allow_undefined(var, ctx.typeof(body_var))]
         bc.encode_ContinueOp(ctx.builder, next_values)
         return ()
 
     @override
     def _to_string_rhs(self) -> str:
-        return f"continue {', '.join([x.name for x in self.next_vars])}"
+        return f"continue {', '.join([x.name for x in self.values])}"
 
 
 def continue_():
@@ -375,14 +452,11 @@ def continue_():
     assert info is not None
     assert not info.flatten
 
+    add_operation(Continue, (), values=())
+    op = builder.ops[-1]
     next_values = tuple(builder.scope.local.get(name, builder.loc)
                         for name in info.stored_names)
-    for nextval, state in zip(next_values, info.var_states):
-        state.body_phi.propagate(nextval, fail_eagerly=True)
-        if info.is_for_loop:
-            state.result_phi.propagate(nextval)
-
-    add_operation(Continue, (), next_vars=next_values)
+    info.jumps.append(JumpInfo(op, next_values))
 
 
 # Maps to BreakOp
@@ -391,16 +465,16 @@ class Break(TypedOperation):
     def __init__(
         self,
         loc: Loc,
-        output_vars: Tuple[Var, ...] = (),
+        values: Tuple[Var, ...] = (),
     ):
-        super().__init__("break", operands={"output_vars": output_vars}, result_vars=[], loc=loc)
+        super().__init__("break", operands={"values": values}, result_vars=[], loc=loc)
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
         # body_vars is not a typo. We use body variables because they always contain the actual
         # types of the loop variables, whereas result variables may have an InvalidType.
         output_values = [value
-                         for var, body_var in zip(self.output_vars, ctx.innermost_loop.body_vars)
+                         for var, body_var in zip(self.values, ctx.innermost_loop.body_vars)
                          for value in ctx.get_value_tuple_allow_undefined(var,
                                                                           ctx.typeof(body_var))]
         bc.encode_BreakOp(ctx.builder, output_values)
@@ -408,7 +482,7 @@ class Break(TypedOperation):
 
     @override
     def _to_string_rhs(self) -> str:
-        return f"break {', '.join([x.name for x in self.output_vars])}"
+        return f"break {', '.join([x.name for x in self.values])}"
 
 
 def break_():
@@ -419,12 +493,11 @@ def break_():
     if info.flatten:
         return
 
+    add_operation(Break, (), values=())
+    op = builder.ops[-1]
     outputs = tuple(builder.scope.local.get(name, builder.loc)
                     for name in info.stored_names)
-    for val, state in zip(outputs, info.var_states, strict=True):
-        state.result_phi.propagate(val)
-
-    add_operation(Break, (), output_vars=outputs)
+    info.jumps.append(JumpInfo(op, outputs))
 
 
 # Maps to YieldOp
@@ -454,15 +527,13 @@ def end_branch(outputs):
     builder = Builder.get_current()
     info = builder.if_else_info
     if info.flatten:
-        info.flattened_results = outputs
-        return
-    extra_outputs = tuple(builder.scope.local.get(name, builder.loc)
-                          for name in info.stored_names)
-    all_outputs = outputs + extra_outputs
-    for phi, res in zip(info.result_phis, all_outputs, strict=True):
-        phi.propagate(res)
-    info.have_end_branch = True
-    add_operation(EndBranch, (), outputs=all_outputs)
+        op = None
+    else:
+        add_operation(EndBranch, (), outputs=())
+        op = builder.ops[-1]
+        outputs += tuple(builder.scope.local.get(name, builder.loc)
+                         for name in info.stored_names)
+    info.jumps.append(JumpInfo(op, outputs))
 
 
 @terminator
@@ -3366,6 +3437,15 @@ def store_var(name: str, value: Var, loc: Loc | None = None):
     assign(value, new_var)
 
 
+def store_undefined(name: str, ty: Type, loc: Loc | None = None):
+    builder = Builder.get_current()
+    local_scope = builder.scope.local
+    assert local_scope.is_local_name(name)
+    new_var = local_scope.redefine(name, loc or builder.loc)
+    new_var.set_undefined()
+    new_var.set_type(ty)
+
+
 @impl(hir.store_var)
 def store_var_impl(name: Var, value: Var):
     name = require_constant_str(name)
@@ -3379,6 +3459,7 @@ def load_var_impl(name):
     local_scope = builder.scope.local
     if local_scope.is_local_name(name):
         ret = local_scope[name]
+        ret.get_type()  # Trigger an InvalidType check
         if ret.is_undefined():
             raise TileSyntaxError(f"Undefined variable {name} used")
         return ret

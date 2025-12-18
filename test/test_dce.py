@@ -54,7 +54,7 @@ def test_unused_body_var():
     # The yielded variable should also be undefined because it is never used
     continue_op = loop.body[-1]
     assert isinstance(continue_op, Continue)
-    assert continue_op.next_vars[t_idx].is_undefined()
+    assert continue_op.values[t_idx].is_undefined()
 
 
 def test_unused_result_var():
@@ -75,4 +75,4 @@ def test_unused_result_var():
     # The value yielded by "break" should be undefined
     t_idx = [v.get_original_name() for v in loop.body_vars].index("t")
     break_op, = [op for op in func_body.traverse() if isinstance(op, Break)]
-    assert break_op.output_vars[t_idx].is_undefined()
+    assert break_op.values[t_idx].is_undefined()

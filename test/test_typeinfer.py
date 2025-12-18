@@ -329,6 +329,25 @@ def test_control_flow_type_mismatch(kernel):
         compile(kernel, (x, ))
 
 
+def test_unused_type_mismatch_inside_loop():
+    @ct.kernel
+    def kernel(x, y):
+        for i in range(2):
+            if ct.bid(0) == 0:
+                t = ct.gather(x, i)  # t is an int32
+                ct.scatter(x, i, t + 1)
+            else:
+                t = ct.gather(y, i)  # t is a float32
+                ct.scatter(y, i, t + 3.0)
+        # There should be no type error because `t` is never used
+
+    x = torch.tensor([10, 20], dtype=torch.int32, device="cuda")
+    y = torch.tensor([10.0, 20.0], dtype=torch.float32, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (2,), kernel, (x, y))
+    assert x.tolist() == [11, 21]
+    assert y.tolist() == [13.0, 23.0]
+
+
 @pytest.mark.parametrize("val, int32_raises, int64_raises, uint64_raises", [
     (5, False, False, True),
     (-2**31, False, False, True),

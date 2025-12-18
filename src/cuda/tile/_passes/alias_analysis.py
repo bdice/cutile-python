@@ -125,7 +125,7 @@ def _analyze_aliases_in_block(block: Block,
             _analyze_aliases_in_block(op.body, alias_tracker, op, None)
 
         elif isinstance(op, Continue):
-            for next, body, result in zip(op.next_vars, innermost_loop.body_vars,
+            for next, body, result in zip(op.values, innermost_loop.body_vars,
                                           innermost_loop.result_vars, strict=True):
                 # Loop next values can flow into body values
                 _propagate(alias_tracker, next, body)
@@ -136,7 +136,7 @@ def _analyze_aliases_in_block(block: Block,
                     _propagate(alias_tracker, next, result)
 
         elif isinstance(op, Break):
-            for output, result in zip(op.output_vars, innermost_loop.result_vars, strict=True):
+            for output, result in zip(op.values, innermost_loop.result_vars, strict=True):
                 _propagate(alias_tracker, output, result)
 
         elif isinstance(op, IfElse):
