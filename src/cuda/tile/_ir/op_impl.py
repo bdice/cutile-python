@@ -57,7 +57,7 @@ def impl(stub, *, fixed_args: Sequence[Any] = ()):
                 return func(*args, **kwargs)
             finally:
                 _current_stub.stub_and_args = old
-
+        wrapper._is_coroutine = inspect.iscoroutinefunction(func)
         op_implementations[stub] = wrapper
         return orig_func
 

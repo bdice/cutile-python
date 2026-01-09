@@ -144,12 +144,12 @@ def test_reject_runaway_recursion():
                   (x, y, 100000))
 
 
-def test_accept_short_recursion():
+def test_accept_reasonable_recursion():
     x = torch.tensor(100.0, dtype=torch.float32, device="cuda")
     y = torch.zeros_like(x)
     ct.launch(torch.cuda.current_stream(), (1,), main_kernel_recursive_calls,
-              (x, y, 9))
-    assert y.item() == 109.0
+              (x, y, 109))
+    assert y.item() == 209.0
 
 
 def helper_function_array_arguments(x, y, output, B: ct.Constant[int], N: ct.Constant[int]):

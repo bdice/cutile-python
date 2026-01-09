@@ -596,6 +596,15 @@ class Builder:
         finally:
             self.loop_info = old
 
+    @contextmanager
+    def change_scope(self, new_scope: Scope):
+        old = self.scope
+        self.scope = new_scope
+        try:
+            yield
+        finally:
+            self.scope = old
+
     def __enter__(self):
         assert not self._entered
         self._prev_builder = _current_builder.builder

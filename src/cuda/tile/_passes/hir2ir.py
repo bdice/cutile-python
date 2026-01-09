@@ -1,46 +1,52 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
-
 import inspect
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from .ast2hir import get_function_hir
 from .. import TileTypeError
+from .._coroutine_util import resume_after, run_coroutine
 from .._exception import Loc, TileSyntaxError, TileInternalError, TileError, TileRecursionError
 from .._ir import hir, ir
 from .._ir.ir import Var, IRContext, Argument, Scope, LocalScope, BoundMethodValue
-from .._ir.op_impl import op_implementations, impl
+from .._ir.op_impl import op_implementations
 from .._ir.ops import loosely_typed_const, assign, end_branch, return_, continue_, \
-    break_, flatten_block_parameters
+    break_, flatten_block_parameters, store_var
 from .._ir.type import FunctionTy, BoundMethodTy, DTypeConstructor
 from .._ir.typing_support import get_signature
 
 
-MAX_RECURSION_DEPTH = 50
+MAX_RECURSION_DEPTH = 1000
 
 
 def hir2ir(func_hir: hir.Function,
            args: tuple[Argument, ...],
            ir_ctx: IRContext) -> ir.Block:
+    # Run as a coroutine using a software stack, so that we don't exceed Python's recursion limit.
+    return run_coroutine(_hir2ir_coroutine(func_hir, args, ir_ctx))
+
+
+async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], ir_ctx: IRContext):
     scope = _create_scope(func_hir, ir_ctx, call_site=None)
     aggregate_params = [
         scope.local.redefine(param_name, param_loc)
         for param_name, param_loc in zip(func_hir.param_names, func_hir.param_locs, strict=True)
     ]
-    preamble = []
-    for param_name, var, arg in zip(func_hir.param_names, aggregate_params, args, strict=True):
-        var.set_type(arg.type)
-        if arg.is_const:
-            preamble.append(hir.Call((), hir.store_var, (param_name, arg.const_value), (), var.loc))
 
     with ir.Builder(ir_ctx, func_hir.body.loc, scope) as ir_builder:
-        flat_params = flatten_block_parameters(aggregate_params)
         try:
-            _dispatch_hir_block_inner(preamble, func_hir.body, ir_builder)
+            for param_name, var, arg in zip(func_hir.param_names, aggregate_params, args,
+                                            strict=True):
+                var.set_type(arg.type)
+                if arg.is_const:
+                    var = loosely_typed_const(arg.const_value)
+                    store_var(param_name, var, var.loc)
+            flat_params = flatten_block_parameters(aggregate_params)
+
+            await _dispatch_hir_block_inner(func_hir.body, ir_builder)
         except Exception as e:
             if 'CUTILEIR' in ir_ctx.tile_ctx.config.log_keys:
                 highlight_loc = e.loc if hasattr(e, 'loc') else None
@@ -60,33 +66,25 @@ def _create_scope(func_hir: hir.Function, ir_ctx: IRContext, call_site: Loc | No
     return Scope(local_scope, func_hir.frozen_globals, call_site)
 
 
-def dispatch_hir_block(block: hir.Block):
-    _dispatch_hir_block_inner((), block, ir.Builder.get_current())
+async def dispatch_hir_block(block: hir.Block, cur_builder: ir.Builder | None = None):
+    if cur_builder is None:
+        cur_builder = ir.Builder.get_current()
+    await _dispatch_hir_block_inner(block, cur_builder)
 
 
-@dataclass
-class _State:
-    done: list[hir.Call]
-    current: hir.Call | None
-    todo_stack: list[hir.Call]
-
-    @contextmanager
-    def next_call(self):
-        call = self.current = self.todo_stack.pop()
-        yield call
-        # Intentionally not in a "finally" block because we want to preserve the state
-        # for the debug printout in case of an exception.
-        self.current = None
-        self.done.append(call)
-
-
-def _dispatch_hir_block_inner(preamble: Sequence[hir.Call],
-                              block: hir.Block,
-                              builder: ir.Builder):
-    state = _State([], None, list(reversed(block.calls)) + list(reversed(preamble)))
+async def _dispatch_hir_block_inner(block: hir.Block, builder: ir.Builder):
+    cursor = 0  # Pre-initialize to guarantee it's defined in the `except` block
     try:
-        if not _dispatch_hir_calls(state, builder):
-            return ()
+        for cursor, call in enumerate(block.calls):
+            loc = _add_call_site(call.loc, builder)
+            with _wrap_exceptions(loc), builder.change_loc(loc):
+                await _dispatch_call(call, builder)
+            if builder.is_terminated:
+                # The current block has been terminated, e.g. by flattening an if-else
+                # with a constant condition (`if True: break`).
+                return
+        cursor = len(block.calls)
+
         result_vars = tuple(_resolve_operand(x) for x in block.results)
         loc = _add_call_site(block.jump_loc, builder)
         with _wrap_exceptions(loc), builder.change_loc(loc):
@@ -94,20 +92,15 @@ def _dispatch_hir_block_inner(preamble: Sequence[hir.Call],
     except Exception:
         if 'CUTILEIR' in builder.ir_ctx.tile_ctx.config.log_keys:
             hir_params = ", ".join(p.name for p in block.params)
-            hir_lines = [str(c) for c in state.done]
-            cur_idx = len(hir_lines)
-            if state.current is not None:
-                hir_lines.append(str(state.current))
-            hir_lines.extend(str(c) for c in reversed(state.todo_stack))
+            hir_lines = [str(c) for c in block.calls]
             hir_lines.append(block.jump_str())
-            hir_str = "\n".join("{}{}".format("--> " if i == cur_idx else "    ", c)
+            hir_str = "\n".join("{}{}".format("--> " if i == cursor else "    ", c)
                                 for i, c in enumerate(hir_lines))
             print(f"==== HIR for ^{block.name}({hir_params}) ====\n{hir_str}\n", file=sys.stderr)
         raise
 
 
-def _dispatch_hir_jump(jump: hir.Jump,
-                       block_results: tuple[Var, ...]):
+def _dispatch_hir_jump(jump: hir.Jump | None, block_results: tuple[Var, ...]):
     match jump:
         case hir.Jump.END_BRANCH:
             end_branch(block_results)
@@ -120,21 +113,8 @@ def _dispatch_hir_jump(jump: hir.Jump,
         case hir.Jump.RETURN:
             assert len(block_results) == 1
             return_(block_results[0])
+        case None: pass
         case _: assert False
-
-
-def _dispatch_hir_calls(state: _State, cur_builder: ir.Builder) -> bool:
-    while len(state.todo_stack) > 0:
-        with state.next_call() as call:
-            loc = _add_call_site(call.loc, cur_builder)
-            with _wrap_exceptions(loc), cur_builder.change_loc(loc):
-                _dispatch_call(call, cur_builder, state.todo_stack)
-            if cur_builder.is_terminated:
-                # The current block has been terminated, e.g. by flattening an if-else
-                # with a constant condition (`if True: break`). By returning False,
-                # we signal that the original jump and block results should be ignored.
-                return False
-    return True
 
 
 def _add_call_site(loc: Loc, builder: ir.Builder) -> Loc:
@@ -152,7 +132,7 @@ def _wrap_exceptions(loc: Loc):
             raise TileInternalError(str(e)) from e
 
 
-def _dispatch_call(call: hir.Call, builder: ir.Builder, todo_stack: list[hir.Call]):
+async def _dispatch_call(call: hir.Call, builder: ir.Builder):
     first_idx = len(builder.ops)
     callee_var = _resolve_operand(call.callee)
     callee, self_arg = _get_callee_and_self(callee_var)
@@ -161,7 +141,11 @@ def _dispatch_call(call: hir.Call, builder: ir.Builder, todo_stack: list[hir.Cal
     arg_list = _bind_args(callee, args, kwargs)
 
     if callee in op_implementations:
-        result = op_implementations[callee](*arg_list)
+        impl = op_implementations[callee]
+        result = impl(*arg_list)
+        if impl._is_coroutine:
+            result = await result
+
         if builder.is_terminated:
             # The current block has been terminated, e.g. by flattening an if-else
             # with a constant condition (`if True: break`). Ignore the `result` in this case.
@@ -203,25 +187,20 @@ def _dispatch_call(call: hir.Call, builder: ir.Builder, todo_stack: list[hir.Cal
                                       " functions are not supported")
         callee_hir = get_function_hir(callee, builder.ir_ctx, entry_point=False)
 
-        # Since `todo_stack` is a stack, we push things backwards. First, we push identity()
-        # calls to assign the temporary return values back to the original result variables.
+        # Activate a fresh Scope.
+        new_scope = _create_scope(callee_hir, builder.ir_ctx, call_site=builder.loc)
+        with builder.change_scope(new_scope):
+            # Call store_var() to bind arguments to parameters.
+            for arg, param_name, param_loc in zip(arg_list, callee_hir.param_names,
+                                                  callee_hir.param_locs, strict=True):
+                store_var(param_name, arg, param_loc)
+
+            # Dispatch the function body. Use resume_after() to break the call stack
+            # and make sure we stay within the Python's recursion limit.
+            await resume_after(dispatch_hir_block(callee_hir.body, builder))
+
         for callee_retval, caller_res in zip(callee_hir.body.results, call.results):
-            todo_stack.append(hir.Call((caller_res,), hir.identity, (callee_retval,), (), call.loc))
-
-        # Now we create a fresh Scope for the new function and install it on the builder.
-        # We need to reset the builder back to the old scope when we return.
-        # For this purpose, we push a call to the special _set_scope stub.
-        old_scope = builder.scope
-        todo_stack.append(hir.Call((), _set_scope, (old_scope,), (), call.loc))
-        builder.scope = _create_scope(callee_hir, builder.ir_ctx, call_site=builder.loc)
-
-        # Now push the function body.
-        todo_stack.extend(reversed(callee_hir.body.calls))
-
-        # Finally, call store_var() to bind arguments to parameters.
-        for arg, param_name, param_loc in zip(arg_list, callee_hir.param_names,
-                                              callee_hir.param_locs, strict=True):
-            todo_stack.append(hir.Call((), hir.store_var, (param_name, arg), (), param_loc))
+            assign(callee_retval, caller_res)
 
 
 def _is_freshly_defined(var: Var, builder: ir.Builder, first_idx: int):
@@ -277,13 +256,3 @@ def _bind_args(sig_func, args, kwargs) -> list[Var]:
             assert param.default is not param.empty
             ret.append(loosely_typed_const(param.default))
     return ret
-
-
-def _set_scope(scope): ...
-
-
-@impl(_set_scope)
-def _set_scope_impl(scope):
-    assert isinstance(scope, Scope)
-    builder = ir.Builder.get_current()
-    builder.scope = scope

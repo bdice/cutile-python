@@ -161,7 +161,7 @@ class Loop(TypedOperation):
 
 
 @impl(hir.loop)
-def loop_impl(body: hir.Block, iterable: Var):
+async def loop_impl(body: hir.Block, iterable: Var):
     from .._passes.hir2ir import dispatch_hir_block
 
     range_ty = require_optional_range_type(iterable)
@@ -171,7 +171,7 @@ def loop_impl(body: hir.Block, iterable: Var):
         # have a "break" at the end of the loop body, and no other break/continue statements.
         info = ControlFlowInfo((), flatten=True)
         with Builder.get_current().change_loop_info(info):
-            dispatch_hir_block(body)
+            await dispatch_hir_block(body)
         return ()
 
     builder = Builder.get_current()
@@ -207,7 +207,7 @@ def loop_impl(body: hir.Block, iterable: Var):
         flat_body_vars = flatten_block_parameters(body_vars)
 
         # Dispatch the body (hir.Block) to populate the new_body (ir.Block) with Operations
-        dispatch_hir_block(body)
+        await dispatch_hir_block(body)
 
     # Propagate type information from Continue/Break to body/result phis
     for jump_info in loop_info.jumps:
@@ -359,11 +359,11 @@ class IfElse(TypedOperation):
         return f"if(cond={self.cond})"
 
 
-def _flatten_branch(branch: hir.Block) -> tuple[Var, ...]:
+async def _flatten_branch(branch: hir.Block) -> tuple[Var, ...]:
     from .._passes.hir2ir import dispatch_hir_block
     info = ControlFlowInfo((), flatten=True)
     with Builder.get_current().change_if_else_info(info):
-        dispatch_hir_block(branch)
+        await dispatch_hir_block(branch)
     if len(info.jumps) == 0:
         return ()
     else:
@@ -372,13 +372,13 @@ def _flatten_branch(branch: hir.Block) -> tuple[Var, ...]:
 
 
 @impl(hir.if_else)
-def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tuple[Var, ...]:
+async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tuple[Var, ...]:
     from .._passes.hir2ir import dispatch_hir_block
 
     require_bool(cond)
     if cond.is_constant():
         branch_taken = then_block if cond.get_constant() else else_block
-        return _flatten_branch(branch_taken)
+        return await _flatten_branch(branch_taken)
 
     # Get the total number of results by adding the number of stored variables.
     # Note: we sort the stored variable names to make the order deterministic.
@@ -387,7 +387,7 @@ def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tup
     # Convert the "then" branch from HIR to IR
     info = ControlFlowInfo(stored_names)
     with nested_block(then_block.name, then_block.loc, if_else_info=info) as new_then_block:
-        dispatch_hir_block(then_block)
+        await dispatch_hir_block(then_block)
 
     # If "then" branch doesn't yield, transform our if-else into the following:
     #    if cond:
@@ -402,11 +402,11 @@ def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) -> tup
             end_branch(())
         add_operation(IfElse, (),
                       cond=cond, then_block=new_then_block, else_block=new_else_block)
-        return _flatten_branch(else_block)
+        return await _flatten_branch(else_block)
 
     # Convert the "else" branch from HIR to IR
     with nested_block(else_block.name, else_block.loc, if_else_info=info) as new_else_block:
-        dispatch_hir_block(else_block)
+        await dispatch_hir_block(else_block)
 
     # Do type/constant propagation
     num_results = len(info.jumps[0].outputs)
