@@ -24,6 +24,9 @@ if (NOT CUDAToolkit_INCLUDE_DIRS)
     if (MSVC)
         _CUDAToolkit_find("$ENV{CUDA_PATH}")
     endif()
+    if (DEFINED ENV{CUDAToolkit_ROOT})
+        _CUDAToolkit_find("$ENV{CUDAToolkit_ROOT}")
+    endif()
 endif()
 
 find_package_handle_standard_args(CUDAToolkit
