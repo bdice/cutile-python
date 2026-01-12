@@ -1782,6 +1782,20 @@ def dtype_constructor_impl(new_dtype: DType, x: Var) -> Var:
     return astype(x, new_dtype)
 
 
+@impl(float, fixed_args=[float])
+@impl(int, fixed_args=[int])
+@impl(bool, fixed_args=[bool])
+def builtin_numeric_ctor_impl(ctor_obj: Any, x: Var) -> Var:
+    if not x.is_constant():
+        raise TileTypeError(f"{ctor_obj.__name__}() expects a constant argument")
+    const = x.get_constant()
+    try:
+        value = ctor_obj(const)
+    except (ValueError, TypeError, OverflowError):
+        raise TileTypeError(f"Invalid argument for {ctor_obj.__name__}({const})")
+    return loosely_typed_const(value)
+
+
 # ================================================
 # Tile specific operations
 # ================================================

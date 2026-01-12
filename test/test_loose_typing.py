@@ -186,3 +186,20 @@ def test_combine_loose_and_strict_int():
     a = torch.zeros((4,), dtype=torch.int32, device="cuda")
     ct.launch(torch.cuda.current_stream(), (1,), combine_loose_and_strict_int, (5, a))
     assert a.tolist() == [7, 8, 9, 10]
+
+
+@ct.kernel
+def call_float_and_store(out):
+    c1 = float("2.0")
+    # Since out is f16, this would fail if `c` is a strictly typed f32:
+    ct.scatter(out, 0, c1)
+
+    # Calling float() on a strictly typed constant should produce a loosely typed one:
+    c2 = float(ct.float32(5.0))
+    ct.scatter(out, 1, c2)
+
+
+def test_float_constructor_produces_loosely_typed_constant():
+    a = torch.zeros((2,), dtype=torch.float16, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (1,), call_float_and_store, (a,))
+    assert a.tolist() == [2.0, 5.0]

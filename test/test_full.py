@@ -139,6 +139,8 @@ def create_full_kernel(name: str, value: str, dtype: str, tmp_path: Path, global
     ("1.0", torch.float64),
     ("1.0", torch.float32),
     ("np.inf", torch.float32),
+    ("float('inf')", torch.float32),
+    ("float('-inf')", torch.float32),
     ("1.0", torch.float16),
     ("1", torch.int64),
     ("1", torch.int32),
@@ -161,7 +163,12 @@ def test_full_np_dtype(value_dtype, use_cupy: bool, tmp_path: Path):
     kernel = create_full_kernel("create_full_np_dtype", value_str, dtype_str,
                                 tmp_path, globals)
     ct.launch(torch.cuda.current_stream(), grid, kernel, (x, tile[0]))
-    torch_value = 1 if "inf" not in value_str else np.inf
+    if "-inf" in value_str:
+        torch_value = -np.inf
+    elif "inf" in value_str:
+        torch_value = np.inf
+    else:
+        torch_value = 1
     assert_equal(x, torch.full(shape, torch_value, dtype=dtype, device=x.device))
 
 
