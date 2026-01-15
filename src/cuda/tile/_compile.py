@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
+import inspect
 import math
 import re
 from dataclasses import dataclass
@@ -16,19 +17,19 @@ import sys
 import tempfile
 import threading
 import traceback
-from typing import Callable, Optional, Any, Set
+from typing import Callable, Optional, Any, Set, Sequence
 import zipfile
 
 from cuda.tile._cext import get_compute_capability, TileContext, default_tile_context
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._const_utils import get_constant_annotations
+from cuda.tile._context import TileContextConfig
 from cuda.tile._exception import (
     TileCompilerError,
     TileCompilerExecutionError,
     TileCompilerTimeoutError, TileValueError, TileTypeError
 )
 from cuda.tile._ir import ir, hir
-from cuda.tile._ir.ir import Argument
 from cuda.tile._ir.typing_support import typeof_pyval, get_constant_value
 from cuda.tile._passes.ast2hir import get_function_hir
 from cuda.tile._passes.code_motion import hoist_loop_invariants
@@ -73,13 +74,13 @@ def global_compiler_lock(func):
     return wrapper
 
 
-def _get_final_ir(pyfunc, args, tile_context) -> ir.Function:
-    ir_ctx = ir.IRContext(tile_context)
+def _get_final_ir(pyfunc,
+                  args: Sequence[ir.KernelArgument],
+                  config: TileContextConfig) -> ir.Function:
     func_hir: hir.Function = get_function_hir(pyfunc, entry_point=True)
 
-    ir_args = _bind_kernel_arguments(tuple(func_hir.signature.parameters),
-                                     args, get_constant_annotations(pyfunc))
-    func_body = hir2ir(func_hir, ir_args, ir_ctx)
+    ir_ctx = ir.IRContext(config)
+    func_body = hir2ir(func_hir, args, ir_ctx)
     eliminate_assign_ops(func_body)
     dead_code_elimination_pass(func_body)
 
@@ -100,7 +101,7 @@ def _get_final_ir(pyfunc, args, tile_context) -> ir.Function:
 
 def _bind_kernel_arguments(param_names: tuple[str, ...],
                            args: tuple[Any, ...],
-                           constant_args: Set[str]) -> tuple[Argument, ...]:
+                           constant_args: Set[str]) -> tuple[ir.KernelArgument, ...]:
     # TODO: unify this logic with dispatcher from c extension
     # Refactor "extract_cuda_args" to return type descriptor
     # that can be wrapped as IR Type for type inference.
@@ -120,9 +121,7 @@ def _bind_kernel_arguments(param_names: tuple[str, ...],
                 raise TileTypeError(
                     f"Argument `{param_name}` is a constexpr, "
                     f"but the value is not a supported constant.")
-        ir_args.append(Argument(type=ty,
-                                is_const=is_const,
-                                const_value=const_val))
+        ir_args.append(ir.KernelArgument(type=ty, is_const=is_const, const_value=const_val))
     return tuple(ir_args)
 
 
@@ -181,7 +180,9 @@ def compile_tile(pyfunc,
                  args,
                  compiler_options: CompilerOptions,
                  context: TileContext = default_tile_context) -> TileLibrary:
-    func_ir = _get_final_ir(pyfunc, args, context)
+    param_names = tuple(inspect.signature(pyfunc).parameters.keys())
+    ir_args = _bind_kernel_arguments(param_names, args, get_constant_annotations(pyfunc))
+    func_ir = _get_final_ir(pyfunc, ir_args, context.config)
 
     if 'CUTILEIR' in context.config.log_keys:
         code = (f"==== CuTile IR for {func_ir.name}==== \n\n"

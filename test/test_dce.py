@@ -2,19 +2,26 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-
 import cuda.tile as ct
+from cuda.tile._ir.ir import KernelArgument
 from cuda.tile._ir.ops import Loop, Continue, Break
 from cuda.tile._ir import ir
 from cuda.tile._compile import _get_final_ir
 from cuda.tile._cext import default_tile_context
+from cuda.tile._ir.type import ArrayTy, TupleTy, SizeTy
 
 
 def get_ir(func) -> ir.Block:
-    x = torch.zeros(10, device="cuda")
-    ir = _get_final_ir(func, (x,), default_tile_context)
-    print(ir)
+    x = KernelArgument(type=ArrayTy(ct.int32,
+                                    shape=TupleTy((SizeTy(),)),
+                                    strides=TupleTy((SizeTy(1,),)),
+                                    elements_disjoint=True,
+                                    base_ptr_div_by=None,
+                                    stride_div_by=(None,),
+                                    shape_div_by=(None,)),
+                       is_const=False,
+                       const_value=None)
+    ir = _get_final_ir(func, (x,), default_tile_context.config)
     return ir.body
 
 

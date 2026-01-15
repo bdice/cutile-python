@@ -22,20 +22,21 @@ from cuda.tile._exception import (
     TileTypeError, Loc, TileInternalError
 )
 from .._cext import TileContext
+from .._context import TileContextConfig
 
 if TYPE_CHECKING:
     from cuda.tile._ir2bytecode import BytecodeContext
 
 
 class IRContext:
-    def __init__(self, tile_ctx: TileContext):
+    def __init__(self, config: TileContextConfig):
         self._all_vars: Dict[str, str] = {}
         self._counter_by_name: Dict[str, Iterator[int]] = defaultdict(itertools.count)
         self._temp_counter = itertools.count()
         self.typemap: Dict[str, Type] = dict()
         self.constants: Dict[str, Any] = dict()
         self._loose_typemap: Dict[str, Type] = dict()
-        self.tile_ctx: TileContext = tile_ctx
+        self.config: TileContext = config
         self._aggregate_values: Dict[str, Any] = dict()
 
     #  Make a Var with a unique name based on `name`.
@@ -822,7 +823,7 @@ class Function:
 
 
 @dataclass
-class Argument:
+class KernelArgument:
     type: Type
     is_const: bool = False
     const_value: Any = None

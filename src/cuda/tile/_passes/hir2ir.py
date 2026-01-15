@@ -4,14 +4,14 @@
 import inspect
 import sys
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Sequence
 
 from .ast2hir import get_function_hir
 from .. import TileTypeError
 from .._coroutine_util import resume_after, run_coroutine
 from .._exception import Loc, TileSyntaxError, TileInternalError, TileError, TileRecursionError
 from .._ir import hir, ir
-from .._ir.ir import Var, IRContext, Argument, BoundMethodValue, ClosureValue
+from .._ir.ir import Var, IRContext, BoundMethodValue, ClosureValue, KernelArgument
 from .._ir.op_impl import op_implementations
 from .._ir.ops import loosely_typed_const, end_branch, return_, continue_, \
     break_, flatten_block_parameters, store_var
@@ -23,14 +23,13 @@ from .._ir.typing_support import get_signature, Closure
 MAX_RECURSION_DEPTH = 1000
 
 
-def hir2ir(func_hir: hir.Function,
-           args: tuple[Argument, ...],
-           ir_ctx: IRContext) -> ir.Block:
+def hir2ir(func_hir: hir.Function, args: Sequence[KernelArgument], ir_ctx: IRContext) -> ir.Block:
     # Run as a coroutine using a software stack, so that we don't exceed Python's recursion limit.
     return run_coroutine(_hir2ir_coroutine(func_hir, args, ir_ctx))
 
 
-async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], ir_ctx: IRContext):
+async def _hir2ir_coroutine(func_hir: hir.Function, args: Sequence[KernelArgument],
+                            ir_ctx: IRContext):
     scope = _create_scope(func_hir, ir_ctx, call_site=None, parent_scopes=())
     aggregate_params = [
         scope.local.redefine(local_idx, param_loc)
@@ -50,7 +49,7 @@ async def _hir2ir_coroutine(func_hir: hir.Function, args: tuple[Argument, ...], 
 
             await _dispatch_hir_block_inner(func_hir.body, ir_builder)
         except Exception as e:
-            if 'CUTILEIR' in ir_ctx.tile_ctx.config.log_keys:
+            if 'CUTILEIR' in ir_ctx.config.log_keys:
                 highlight_loc = e.loc if hasattr(e, 'loc') else None
                 ir_str = "\n".join(op.to_string(highlight_loc=highlight_loc)
                                    for op in ir_builder.ops)
@@ -93,7 +92,7 @@ async def _dispatch_hir_block_inner(block: hir.Block, builder: ir.Builder):
         with _wrap_exceptions(loc), builder.change_loc(loc):
             _dispatch_hir_jump(block, scope)
     except Exception:
-        if 'CUTILEIR' in builder.ir_ctx.tile_ctx.config.log_keys:
+        if 'CUTILEIR' in builder.ir_ctx.config.log_keys:
             hir_params = ", ".join(p.name for p in block.params)
             hir_lines = [str(c) for c in block.calls]
             hir_lines.append(block.jump_str())
