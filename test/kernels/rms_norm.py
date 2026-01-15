@@ -6,7 +6,7 @@ import cuda.tile as ct
 import numpy as np
 
 
-@ct.kernel
+@ct.kernel(occupancy=ct.ByTarget(sm_100=16))
 def rms_norm_kernel(
     x,
     w,
