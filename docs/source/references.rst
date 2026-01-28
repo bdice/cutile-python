@@ -21,111 +21,111 @@
 .. |tile code| replace:: :ref:`tile code <tile code>`
 .. |Tile code| replace:: :ref:`Tile code <tile code>`
 
-.. |execution space| replace:: :ref:`execution space <execution:Execution Spaces>`
-.. |Execution space| replace:: :ref:`Execution space <execution:Execution Spaces>`
-.. |execution spaces| replace:: :ref:`execution spaces <execution:Execution Spaces>`
-.. |Execution spaces| replace:: :ref:`Execution spaces <execution:Execution Spaces>`
+.. |execution space| replace:: :ref:`execution space <execution-execution-spaces>`
+.. |Execution space| replace:: :ref:`Execution space <execution-execution-spaces>`
+.. |execution spaces| replace:: :ref:`execution spaces <execution-execution-spaces>`
+.. |Execution spaces| replace:: :ref:`Execution spaces <execution-execution-spaces>`
 
-.. |tile function| replace:: :ref:`tile function <execution:Tile Functions>`
-.. |Tile function| replace:: :ref:`Tile function <execution:Tile Functions>`
-.. |tile functions| replace:: :ref:`tile functions <execution:Tile Functions>`
-.. |Tile functions| replace:: :ref:`Tile functions <execution:Tile Functions>`
+.. |tile function| replace:: :ref:`tile function <execution-tile-functions>`
+.. |Tile function| replace:: :ref:`Tile function <execution-tile-functions>`
+.. |tile functions| replace:: :ref:`tile functions <execution-tile-functions>`
+.. |Tile functions| replace:: :ref:`Tile functions <execution-tile-functions>`
 
-.. |tile kernel| replace:: :ref:`tile kernel <execution:Tile Kernels>`
-.. |Tile kernel| replace:: :ref:`Tile kernel <execution:Tile Kernels>`
-.. |tile kernels| replace:: :ref:`tile kernels <execution:Tile Kernels>`
-.. |Tile kernels| replace:: :ref:`Tile kernels <execution:Tile Kernels>`
-.. |kernel| replace:: :ref:`kernel <execution:Tile Kernels>`
-.. |Kernel| replace:: :ref:`Kernel <execution:Tile Kernels>`
-.. |kernels| replace:: :ref:`kernels <execution:Tile Kernels>`
-.. |Kernels| replace:: :ref:`Kernels <execution:Tile Kernels>`
+.. |tile kernel| replace:: :ref:`tile kernel <execution-tile-kernels>`
+.. |Tile kernel| replace:: :ref:`Tile kernel <execution-tile-kernels>`
+.. |tile kernels| replace:: :ref:`tile kernels <execution-tile-kernels>`
+.. |Tile kernels| replace:: :ref:`Tile kernels <execution-tile-kernels>`
+.. |kernel| replace:: :ref:`kernel <execution-tile-kernels>`
+.. |Kernel| replace:: :ref:`Kernel <execution-tile-kernels>`
+.. |kernels| replace:: :ref:`kernels <execution-tile-kernels>`
+.. |Kernels| replace:: :ref:`Kernels <execution-tile-kernels>`
 
-.. |constant embed| replace:: :ref:`constant embed <execution:Constant Embedding>`
-.. |Constant embed| replace:: :ref:`Constant embed <execution:Constant Embedding>`
-.. |constant embedding| replace:: :ref:`constant embedding <execution:Constant Embedding>`
-.. |Constant embedding| replace:: :ref:`Constant embedding <execution:Constant Embedding>`
-.. |constant embedded| replace:: :ref:`constant embedded <execution:Constant Embedding>`
-.. |Constant embedded| replace:: :ref:`Constant embedded <execution:Constant Embedding>`
+.. |constant embed| replace:: :ref:`constant embed <execution-constant-embedding>`
+.. |Constant embed| replace:: :ref:`Constant embed <execution-constant-embedding>`
+.. |constant embedding| replace:: :ref:`constant embedding <execution-constant-embedding>`
+.. |Constant embedding| replace:: :ref:`Constant embedding <execution-constant-embedding>`
+.. |constant embedded| replace:: :ref:`constant embedded <execution-constant-embedding>`
+.. |Constant embedded| replace:: :ref:`Constant embedded <execution-constant-embedding>`
 
-.. |loosely typed| replace:: :ref:`loosely typed <execution:Constant Expressions & Objects>`
-.. |loosely typed numeric constant| replace:: :ref:`loosely typed numeric constant <execution:Constant Expressions & Objects>`
-.. |loosely typed numeric constants| replace:: :ref:`loosely typed numeric constants <execution:Constant Expressions & Objects>`
+.. |loosely typed| replace:: :ref:`loosely typed <execution-constant-expressions-objects>`
+.. |loosely typed numeric constant| replace:: :ref:`loosely typed numeric constant <execution-constant-expressions-objects>`
+.. |loosely typed numeric constants| replace:: :ref:`loosely typed numeric constants <execution-constant-expressions-objects>`
 
-.. |data model| replace:: :ref:`data model <data:Data Model>`
-.. |Data model| replace:: :ref:`Data model <data:Data Model>`
+.. |data model| replace:: :ref:`data model <data-data-model>`
+.. |Data model| replace:: :ref:`Data model <data-data-model>`
 
-.. |global array| replace:: :ref:`global array <data/array:cuda.tile.Array>`
-.. |Global array| replace:: :ref:`Global array <data/array:cuda.tile.Array>`
-.. |global arrays| replace:: :ref:`global arrays <data/array:cuda.tile.Array>`
-.. |Global arrays| replace:: :ref:`Global arrays <data/array:cuda.tile.Array>`
-.. |array| replace:: :ref:`array <data/array:cuda.tile.Array>`
-.. |Array| replace:: :ref:`Array <data/array:cuda.tile.Array>`
-.. |arrays| replace:: :ref:`arrays <data/array:cuda.tile.Array>`
-.. |Arrays| replace:: :ref:`Arrays <data/array:cuda.tile.Array>`
+.. |global array| replace:: :ref:`global array <data-array-cuda-tile-array>`
+.. |Global array| replace:: :ref:`Global array <data-array-cuda-tile-array>`
+.. |global arrays| replace:: :ref:`global arrays <data-array-cuda-tile-array>`
+.. |Global arrays| replace:: :ref:`Global arrays <data-array-cuda-tile-array>`
+.. |array| replace:: :ref:`array <data-array-cuda-tile-array>`
+.. |Array| replace:: :ref:`Array <data-array-cuda-tile-array>`
+.. |arrays| replace:: :ref:`arrays <data-array-cuda-tile-array>`
+.. |Arrays| replace:: :ref:`Arrays <data-array-cuda-tile-array>`
 
-.. |tile| replace:: :ref:`tile <data/tile:cuda.tile.Tile>`
-.. |Tile| replace:: :ref:`Tile <data/tile:cuda.tile.Tile>`
-.. |tiles| replace:: :ref:`tiles <data/tile:cuda.tile.Tile>`
-.. |Tiles| replace:: :ref:`Tiles <data/tile:cuda.tile.Tile>`
+.. |tile| replace:: :ref:`tile <data-tile-cuda-tile-tile>`
+.. |Tile| replace:: :ref:`Tile <data-tile-cuda-tile-tile>`
+.. |tiles| replace:: :ref:`tiles <data-tile-cuda-tile-tile>`
+.. |Tiles| replace:: :ref:`Tiles <data-tile-cuda-tile-tile>`
 
-.. |data type| replace:: :ref:`data type <data:Data Types>`
-.. |Data type| replace:: :ref:`Data type <data:Data Types>`
-.. |data types| replace:: :ref:`data types <data:Data Types>`
-.. |Data types| replace:: :ref:`Data types <data:Data Types>`
-.. |dtype| replace:: :ref:`dtype <data:Data Types>`
-.. |Dtype| replace:: :ref:`Dtype <data:Data Types>`
-.. |dtypes| replace:: :ref:`dtypes <data:Data Types>`
-.. |Dtypes| replace:: :ref:`Dtypes <data:Data Types>`
+.. |data type| replace:: :ref:`data type <data-data-types>`
+.. |Data type| replace:: :ref:`Data type <data-data-types>`
+.. |data types| replace:: :ref:`data types <data-data-types>`
+.. |Data types| replace:: :ref:`Data types <data-data-types>`
+.. |dtype| replace:: :ref:`dtype <data-data-types>`
+.. |Dtype| replace:: :ref:`Dtype <data-data-types>`
+.. |dtypes| replace:: :ref:`dtypes <data-data-types>`
+.. |Dtypes| replace:: :ref:`Dtypes <data-data-types>`
 
-.. |numeric data type| replace:: :ref:`numeric data type <data:Numeric & Arithmetic Data Types>`
-.. |Numeric data type| replace:: :ref:`Numeric data type <data:Numeric & Arithmetic Data Types>`
-.. |numeric data types| replace:: :ref:`numeric data types <data:Numeric & Arithmetic Data Types>`
-.. |Numeric data types| replace:: :ref:`Numeric data types <data:Numeric & Arithmetic Data Types>`
-.. |numeric dtype| replace:: :ref:`numeric dtype <data:Numeric & Arithmetic Data Types>`
-.. |Numeric dtype| replace:: :ref:`Numeric dtype <data:Numeric & Arithmetic Data Types>`
-.. |numeric dtypes| replace:: :ref:`numeric dtypes <data:Numeric & Arithmetic Data Types>`
-.. |Numeric dtypes| replace:: :ref:`Numeric dtypes <data:Numeric & Arithmetic Data Types>`
+.. |numeric data type| replace:: :ref:`numeric data type <data-numeric-arithmetic-data-types>`
+.. |Numeric data type| replace:: :ref:`Numeric data type <data-numeric-arithmetic-data-types>`
+.. |numeric data types| replace:: :ref:`numeric data types <data-numeric-arithmetic-data-types>`
+.. |Numeric data types| replace:: :ref:`Numeric data types <data-numeric-arithmetic-data-types>`
+.. |numeric dtype| replace:: :ref:`numeric dtype <data-numeric-arithmetic-data-types>`
+.. |Numeric dtype| replace:: :ref:`Numeric dtype <data-numeric-arithmetic-data-types>`
+.. |numeric dtypes| replace:: :ref:`numeric dtypes <data-numeric-arithmetic-data-types>`
+.. |Numeric dtypes| replace:: :ref:`Numeric dtypes <data-numeric-arithmetic-data-types>`
 
-.. |arithmetic data type| replace:: :ref:`arithmetic data type <data:Numeric & Arithmetic Data Types>`
-.. |Arithmetic data type| replace:: :ref:`Arithmetic data type <data:Numeric & Arithmetic Data Types>`
-.. |arithmetic data types| replace:: :ref:`arithmetic data types <data:Numeric & Arithmetic Data Types>`
-.. |Arithmetic data types| replace:: :ref:`Arithmetic data types <data:Numeric & Arithmetic Data Types>`
-.. |arithmetic dtype| replace:: :ref:`arithmetic dtype <data:Numeric & Arithmetic Data Types>`
-.. |Arithmetic dtype| replace:: :ref:`Arithmetic dtype <data:Numeric & Arithmetic Data Types>`
-.. |arithmetic dtypes| replace:: :ref:`arithmetic dtypes <data:Numeric & Arithmetic Data Types>`
-.. |Arithmetic dtypes| replace:: :ref:`Arithmetic dtypes <data:Numeric & Arithmetic Data Types>`
+.. |arithmetic data type| replace:: :ref:`arithmetic data type <data-numeric-arithmetic-data-types>`
+.. |Arithmetic data type| replace:: :ref:`Arithmetic data type <data-numeric-arithmetic-data-types>`
+.. |arithmetic data types| replace:: :ref:`arithmetic data types <data-numeric-arithmetic-data-types>`
+.. |Arithmetic data types| replace:: :ref:`Arithmetic data types <data-numeric-arithmetic-data-types>`
+.. |arithmetic dtype| replace:: :ref:`arithmetic dtype <data-numeric-arithmetic-data-types>`
+.. |Arithmetic dtype| replace:: :ref:`Arithmetic dtype <data-numeric-arithmetic-data-types>`
+.. |arithmetic dtypes| replace:: :ref:`arithmetic dtypes <data-numeric-arithmetic-data-types>`
+.. |Arithmetic dtypes| replace:: :ref:`Arithmetic dtypes <data-numeric-arithmetic-data-types>`
 
-.. |type promotion| replace:: :ref:`type promotion <data:Arithmetic Promotion>`
+.. |type promotion| replace:: :ref:`type promotion <data-arithmetic-promotion>`
 
-.. |tile space| replace:: :ref:`tile space <data:Element & Tile Space>`
-.. |Tile space| replace:: :ref:`Tile space <data:Element & Tile Space>`
-.. |tile spaces| replace:: :ref:`tile spaces <data:Element & Tile Space>`
-.. |Tile spaces| replace:: :ref:`Tile spaces <data:Element & Tile Space>`
+.. |tile space| replace:: :ref:`tile space <data-element-tile-space>`
+.. |Tile space| replace:: :ref:`Tile space <data-element-tile-space>`
+.. |tile spaces| replace:: :ref:`tile spaces <data-element-tile-space>`
+.. |Tile spaces| replace:: :ref:`Tile spaces <data-element-tile-space>`
 
-.. |scalar| replace:: :ref:`scalar <data:Scalars>`
-.. |Scalar| replace:: :ref:`Scalar <data:Scalars>`
-.. |scalars| replace:: :ref:`scalars <data:Scalars>`
-.. |Scalars| replace:: :ref:`Scalars <data:Scalars>`
+.. |scalar| replace:: :ref:`scalar <data-scalars>`
+.. |Scalar| replace:: :ref:`Scalar <data-scalars>`
+.. |scalars| replace:: :ref:`scalars <data-scalars>`
+.. |Scalars| replace:: :ref:`Scalars <data-scalars>`
 
-.. |Rounding Modes| replace:: :ref:`Rounding Modes <data:Rounding Modes>`
-.. |Padding Modes| replace:: :ref:`Padding Modes <data:Padding Modes>`
+.. |Rounding Modes| replace:: :ref:`Rounding Modes <data-rounding-modes>`
+.. |Padding Modes| replace:: :ref:`Padding Modes <data-padding-modes>`
 
-.. |machine representation| replace:: :ref:`machine representation <interoperability:Machine Representation>`
-.. |Machine representation| replace:: :ref:`Machine representation <interoperability:Machine Representation>`
-.. |machine representations| replace:: :ref:`machine representations <interoperability:Machine Representation>`
-.. |Machine representations| replace:: :ref:`Machine representations <interoperability:Machine Representation>`
+.. |machine representation| replace:: :ref:`machine representation <interoperability-machine-representation>`
+.. |Machine representation| replace:: :ref:`Machine representation <interoperability-machine-representation>`
+.. |machine representations| replace:: :ref:`machine representations <interoperability-machine-representation>`
+.. |Machine representations| replace:: :ref:`Machine representations <interoperability-machine-representation>`
 
-.. |operations| replace:: :ref:`operations <operations:Operations>`
+.. |operations| replace:: :ref:`operations <operations-operations>`
 
-.. |loading and storing| replace:: :ref:`loading and storing <operations:Load/Store>`
+.. |loading and storing| replace:: :ref:`loading and storing <operations-load-store>`
 
-.. |factory| replace:: :ref:`factory <operations:Factory>`
-.. |Factory| replace:: :ref:`Factory <operations:Factory>`
+.. |factory| replace:: :ref:`factory <operations-factory>`
+.. |Factory| replace:: :ref:`Factory <operations-factory>`
 
-.. |memory order| replace:: :ref:`memory order <memory_model:Memory Order>`
-.. |Memory Order| replace:: :ref:`Memory Order <memory_model:Memory Order>`
-.. |memory scope| replace:: :ref:`memory scope <memory_model:Memory Scope>`
-.. |Memory Scope| replace:: :ref:`Memory Scope <memory_model:Memory Scope>`
+.. |memory order| replace:: :ref:`memory order <memory-model-memory-order>`
+.. |Memory Order| replace:: :ref:`Memory Order <memory-model-memory-order>`
+.. |memory scope| replace:: :ref:`memory scope <memory-model-memory-scope>`
+.. |Memory Scope| replace:: :ref:`Memory Scope <memory-model-memory-scope>`
 
 .. |Python Array API| replace:: `Python Array API <https://data-apis.org/array-api/latest/>`__
 .. |Numpy broadcasting rule| replace:: `Numpy broadcasting rule <https://numpy.org/devdocs/user/basics.broadcasting.html>`__

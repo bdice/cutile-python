@@ -39,6 +39,8 @@ differing shapes originating from differing |global arrays|.
 .. 
 .. TODO
 
+.. _execution-execution-spaces:
+
 Execution Spaces
 ----------------
 
@@ -64,12 +66,15 @@ The set of *targets* that such a construct is usable on is called its *execution
 Functions can have decorators that explicitly specify their execution space.
 These are called *annotated functions*.
 
+.. _execution-tile-functions:
+
 Tile Functions
 --------------
 
 .. autoclass:: cuda.tile.function
 
 .. _tile-kernels:
+.. _execution-tile-kernels:
 
 Tile Kernels
 ------------
@@ -130,6 +135,8 @@ Unless otherwise specified, the execution shall complete before the function ret
 Constantness
 ------------
 
+.. _execution-constant-expressions-objects:
+
 Constant Expressions & Objects
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -154,6 +161,8 @@ Combining two strictly typed constants creates a new strictly typed constant. In
 the regular |type promotion| rules apply.
 For example, ``ct.int16(5) + ct.int32(7)`` will create a strictly typed ``int32`` constant 12.
 
+
+.. _execution-constant-embedding:
 
 Constant Embedding
 ~~~~~~~~~~~~~~~~~~

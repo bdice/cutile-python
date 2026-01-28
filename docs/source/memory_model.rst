@@ -19,6 +19,8 @@ Synchronization occurs at a per-element granularity. Each element in the array p
 
 For a more detailed explanation, see the Memory Model section in the `Tile IR documentation <https://docs.nvidia.com/cuda/tile-ir/>`_.
 
+.. _memory-model-memory-order:
+
 Memory Order
 -------------------------
 
@@ -26,6 +28,8 @@ Memory Order
    :members:
    :undoc-members:
    :member-order: bysource
+
+.. _memory-model-memory-scope:
 
 Memory Scope
 ------------

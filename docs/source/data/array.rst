@@ -4,6 +4,8 @@
 
 .. currentmodule:: cuda.tile
 
+.. _data-array-cuda-tile-array:
+
 cuda.tile.Array
 ===============
 

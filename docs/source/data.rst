@@ -4,6 +4,8 @@
 
 .. currentmodule:: cuda.tile
 
+.. _data-data-model:
+
 Data Model
 ==========
 
@@ -28,7 +30,7 @@ Global Arrays
    :no-index:
 
    .. seealso::
-      :ref:`Complete cuda.tile.Array class documentation <data/array:cuda.tile.Array>`
+      :ref:`Complete cuda.tile.Array class documentation <data-array-cuda-tile-array>`
 
 .. toctree::
    :maxdepth: 2
@@ -44,13 +46,15 @@ Tiles
    :no-index:
 
    .. seealso::
-      :ref:`Complete cuda.tile.Tile class documentation <data/tile:cuda.tile.Tile>`
+      :ref:`Complete cuda.tile.Tile class documentation <data-tile-cuda-tile-tile>`
 
 .. toctree::
    :maxdepth: 2
    :hidden:
 
    data/tile
+
+.. _data-element-tile-space:
 
 Element & Tile Space
 --------------------
@@ -92,6 +96,8 @@ extended to match the shape of the larger one, following these rules:
 Broadcasting follows the same semantics as |NumPy|, which makes code more concise and readable
 while maintaining computational efficiency.
 
+.. _data-data-types:
+
 Data Types
 ----------
 
@@ -100,12 +106,16 @@ Data Types
 
 .. include:: generated/includes/numeric_dtypes.rst
 
+.. _data-numeric-arithmetic-data-types:
+
 Numeric & Arithmetic Data Types
 -------------------------------
 A *numeric* data type represents numbers. An *arithmetic* data type is a numeric data type
 that supports general arithmetic operations such as addition, subtraction, multiplication,
 and division.
 
+
+.. _data-arithmetic-promotion:
 
 Arithmetic Promotion
 --------------------
@@ -136,6 +146,8 @@ to a common dtype using the following process:
 .. include:: generated/includes/dtype_promotion_table.rst
 
 
+.. _data-scalars:
+
 Scalars
 -------
 
@@ -155,6 +167,8 @@ Tuples
 
 Tuples can be used in |tile code|. They cannot be |kernel| parameters.
 
+.. _data-rounding-modes:
+
 Rounding Modes
 --------------
 
@@ -162,6 +176,8 @@ Rounding Modes
    :members:
    :undoc-members:
    :member-order: bysource
+
+.. _data-padding-modes:
 
 Padding Modes
 -------------

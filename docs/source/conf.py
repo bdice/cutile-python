@@ -24,13 +24,8 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
     'sphinx.ext.napoleon',  # for google style support
-    'sphinx.ext.autosectionlabel',  # for automatic section labels
     'myst_parser',  # for markdown support
 ]
-
-# Configuration for autosectionlabel extension
-autosectionlabel_prefix_document = True  # Prefix labels with the document name
-autosectionlabel_maxdepth = 4  # Only generate labels for sections and subsections
 
 templates_path = ['_templates']
 exclude_patterns = ['references.rst', 'stubs', 'generated/includes']

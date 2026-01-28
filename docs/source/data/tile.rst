@@ -4,6 +4,8 @@
 
 .. currentmodule:: cuda.tile
 
+.. _data-tile-cuda-tile-tile:
+
 cuda.tile.Tile
 ==============
 

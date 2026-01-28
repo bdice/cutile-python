@@ -4,8 +4,12 @@
 
 .. currentmodule:: cuda.tile
 
+.. _operations-operations:
+
 Operations
 ==========
+
+.. _operations-load-store:
 
 Load/Store
 ----------
@@ -21,6 +25,8 @@ Load/Store
    gather
    scatter
 
+
+.. _operations-factory:
 
 Factory
 -------
@@ -61,6 +67,7 @@ Reduction
    prod
    argmax
    argmin
+   reduce
 
 
 Scan
@@ -110,6 +117,7 @@ Math
    minimum
    maximum
    negative
+   abs
 
    exp
    exp2
